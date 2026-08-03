@@ -292,6 +292,7 @@ export async function runScheduled(
     );
     if (!acquired) return;
 
+    let startedJobKey: string | undefined;
     try {
       const kind = jobKind(controller.cron);
       const jobKey = kind + ":" + scheduledAt;
@@ -303,6 +304,7 @@ export async function runScheduled(
       })) {
         return;
       }
+      startedJobKey = jobKey;
 
       const previousQuota = await repo.loadState<QuotaState>("quota");
       const runtime = runtimeCopy(
@@ -526,6 +528,15 @@ export async function runScheduled(
         ],
         events
       });
+    } catch (error) {
+      if (startedJobKey !== undefined) {
+        try {
+          await repo.markJob(startedJobKey, "failed", "internal");
+        } catch {
+          // Best effort only: preserve the original post-start failure.
+        }
+      }
+      throw error;
     } finally {
       await repo.releaseSnapshotLease(owner);
     }
