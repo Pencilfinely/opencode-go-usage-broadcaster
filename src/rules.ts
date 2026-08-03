@@ -58,7 +58,7 @@ function isCredibleReset(
     return true;
   }
   return (
-    current.usedPercent <= previous.usedPercent &&
+    current.usedPercent < previous.usedPercent &&
     Date.parse(current.resetAt) > Date.parse(previous.resetAt) &&
     nowMs >= Date.parse(previous.cycleBoundaryAt) - 5 * 60 * 1000
   );

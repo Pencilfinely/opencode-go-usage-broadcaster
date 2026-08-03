@@ -54,7 +54,7 @@ describe("quota rules", () => {
     );
     const earlyDrop = evaluateSnapshot(
       first.state,
-      snapshot(40, 20, 10, "2026-08-03T03:00:00.000Z"),
+      snapshot(41, 20, 10, "2026-08-03T03:00:00.000Z"),
       Date.parse("2026-08-03T01:30:00Z")
     );
     const reset = evaluateSnapshot(
@@ -75,6 +75,28 @@ describe("quota rules", () => {
       first.state.windows.rolling.cycleKey
     );
     expect(crossedAgain.notifications[0]?.threshold).toBe(75);
+  });
+
+  it("does not rearm when usage is unchanged after the boundary", () => {
+    const first = evaluateSnapshot(
+      null,
+      snapshot(80, 20, 10, "2026-08-03T02:00:00.000Z"),
+      Date.parse("2026-08-03T01:00:00Z")
+    );
+    const earlyDrop = evaluateSnapshot(
+      first.state,
+      snapshot(40, 20, 10, "2026-08-03T03:00:00.000Z"),
+      Date.parse("2026-08-03T01:30:00Z")
+    );
+    const unchangedAfterBoundary = evaluateSnapshot(
+      earlyDrop.state,
+      snapshot(40, 20, 10, "2026-08-03T07:00:00.000Z"),
+      Date.parse("2026-08-03T02:01:00Z")
+    );
+
+    expect(unchangedAfterBoundary.state.windows.rolling.cycleKey).toBe(
+      first.state.windows.rolling.cycleKey
+    );
   });
 
   it("visibly marks fixture threshold messages with all windows and the stable event ID", () => {
