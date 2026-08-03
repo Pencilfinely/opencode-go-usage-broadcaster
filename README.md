@@ -32,6 +32,34 @@ npm run check
 The checked-in example values are unusable test values. Keep `.dev.vars` local
 and do not commit real values.
 
+## Release credential scan
+
+Run both checks before release. A clean `rg` scan emits no output and exits 1;
+the PowerShell guard below turns that expected no-match exit into success and
+fails if a match or scan error occurs. The single file exclusion is intentional:
+`docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md`
+contains this implementation's literal scanner text and reviewed unusable
+`do-not-use` samples. Do not replace it with a broad documentation exclusion.
+
+```powershell
+$credentialPattern = '(' + 'g' + 'hp_|github' + '_pat_|\bsk-[A-Za-z0-9]|Cookie' + ':|Set-Cookie' + ':)'
+$scanOutput = & rg -n --hidden --glob "!node_modules/**" --glob "!.git/**" --glob "!docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md" $credentialPattern .
+if ($LASTEXITCODE -ne 1 -or $scanOutput) {
+  $scanOutput
+  throw "Credential scan expected no matches (rg exit 1)."
+}
+exit 0
+```
+
+```powershell
+$scanOutput = & rg -n --hidden --glob "!node_modules/**" --glob "!.git/**" --glob "!.dev.vars.example" --glob "!docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md" "(PUSHPLUS_TOKEN|PUSHPLUS_TOPIC|PUSHPLUS_CALLBACK_SECRET|OPENCODE_AUTH_COOKIE)[[:space:]]*=" .
+if ($LASTEXITCODE -ne 1 -or $scanOutput) {
+  $scanOutput
+  throw "Credential assignment scan expected no matches (rg exit 1)."
+}
+exit 0
+```
+
 ## Fixture demo
 
 Warning: this manual trigger performs a real PushPlus request when real
