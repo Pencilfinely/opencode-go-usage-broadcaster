@@ -1,7 +1,7 @@
 # OpenCode Go 配额自动广播设计
 
 - 日期：2026-08-03
-- 状态：设计已确认，等待用户审阅书面规格
+- 状态：规格已确认；安全 MVP 实现中（真实 OpenCode 采集器等待受支持接口或书面授权）
 - 部署目标：Cloudflare Workers、D1、PushPlus
 
 ## 1. 决策摘要
