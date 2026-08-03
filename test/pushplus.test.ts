@@ -23,6 +23,8 @@ function claimedEvent(overrides: Partial<ClaimedEvent> = {}): ClaimedEvent {
     content: "Rolling usage reached 50%.",
     attemptCount: 1,
     notAfter: now + 60_000,
+    leaseOwner: "dispatcher-owner",
+    leaseUntil: now + 60_000,
     ...overrides
   };
 }
@@ -30,9 +32,20 @@ function claimedEvent(overrides: Partial<ClaimedEvent> = {}): ClaimedEvent {
 function dispatchRepository(events: ClaimedEvent[]) {
   const remaining = [...events];
   return {
-    claimDueEvent: vi.fn(async () => remaining.shift() ?? null),
-    markAttemptAccepted: vi.fn(async () => undefined),
-    markAttemptFailure: vi.fn(async () => undefined)
+    claimDueEvent: vi.fn(async (owner: string) => {
+      const event = remaining.shift();
+      return event ? { ...event, leaseOwner: owner } : null;
+    }),
+    prepareDispatchClaim: vi.fn(async (
+      _eventId: string,
+      _attemptNo: number,
+      _owner: string,
+      current: number,
+      leaseMs: number
+    ) => current + leaseMs),
+    expireOrRequeueClaim: vi.fn(async () => true),
+    markAttemptAccepted: vi.fn(async () => true),
+    markAttemptFailure: vi.fn(async () => true)
   };
 }
 
@@ -223,6 +236,48 @@ describe("PushPlus callback", () => {
     expect(response.status).toBe(404);
     expect(cancelled).toBe(true);
   });
+
+  it("rejects a callback whose body read crosses the signed expiry", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const expires = now + 10;
+    const signature = await signCallback(secret, "event-slow", expires);
+    let current = now;
+    const body = JSON.stringify({
+      event: "message_complate",
+      messageInfo: {
+        message: "",
+        shortCode: "provider-slow",
+        sendStatus: 2
+      }
+    });
+    const request = new Request(
+      "https://worker.test/callbacks/pushplus/event-slow/" + expires + "/" + signature,
+      {
+        method: "POST",
+        body: new ReadableStream<Uint8Array>({
+          pull(controller) {
+            current = expires;
+            controller.enqueue(new TextEncoder().encode(body));
+            controller.close();
+          }
+        })
+      }
+    );
+    const markSuccess = vi.fn().mockResolvedValue(true);
+
+    const response = await handlePushPlusCallback(
+      request,
+      { callbackSecret: secret },
+      {
+        markCallbackSuccess: markSuccess,
+        markCallbackFailure: vi.fn()
+      },
+      () => current
+    );
+
+    expect(response.status).toBe(404);
+    expect(markSuccess).not.toHaveBeenCalled();
+  });
 });
 
 describe("PushPlus dispatch", () => {
@@ -247,7 +302,7 @@ describe("PushPlus dispatch", () => {
         callbackSecret: secret,
         callbackBaseUrl: "https://worker.test"
       },
-      now,
+      () => now,
       fetchImpl
     );
 
@@ -279,6 +334,7 @@ describe("PushPlus dispatch", () => {
     expect(repo.markAttemptAccepted).toHaveBeenCalledWith(
       event.id,
       event.attemptCount,
+      expect.any(String),
       "provider-1",
       now
     );
@@ -301,16 +357,91 @@ describe("PushPlus dispatch", () => {
         callbackSecret: secret,
         callbackBaseUrl: "https://worker.test"
       },
-      now,
+      () => now,
       fetchImpl
     );
 
     expect(repo.markAttemptFailure).toHaveBeenCalledWith(
       event.id,
       event.attemptCount,
+      expect.any(String),
       now,
       now + 30 * 60 * 1000
     );
     expect(repo.markAttemptAccepted).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["notAfter", { notAfter: now + 10, leaseUntil: now + 60_000 }, now + 10],
+    ["lease", { notAfter: now + 120_000, leaseUntil: now + 10 }, now + 10]
+  ] as const)("does not send when a resumed claim reaches its %s boundary", async (
+    _boundary,
+    overrides,
+    boundaryNow
+  ) => {
+    const event = claimedEvent(overrides);
+    const repo = dispatchRepository([event]);
+    const times = [now, boundaryNow];
+    const clock = () => times.shift() ?? boundaryNow;
+    const fetchImpl = vi.fn();
+
+    await dispatchDue(
+      repo as unknown as Repository,
+      {
+        token: "pushplus-token",
+        topic: "pushplus-topic",
+        callbackSecret: secret,
+        callbackBaseUrl: "https://worker.test"
+      },
+      clock,
+      fetchImpl
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(repo.expireOrRequeueClaim).toHaveBeenCalledWith(
+      event.id,
+      event.attemptCount,
+      expect.any(String),
+      boundaryNow
+    );
+  });
+
+  it.each([
+    ["notAfter", { notAfter: now + 10, leaseUntil: now + 60_000 }, now + 10],
+    ["renewed lease", { notAfter: now + 120_000, leaseUntil: now + 60_000 }, now + 60_000]
+  ] as const)("checks %s again after claim preparation stalls", async (
+    _boundary,
+    overrides,
+    boundaryNow
+  ) => {
+    const event = claimedEvent(overrides);
+    const repo = dispatchRepository([event]);
+    let current = now;
+    repo.prepareDispatchClaim.mockImplementation(async () => {
+      current = boundaryNow;
+      return boundaryNow;
+    });
+    const fetchImpl = vi.fn();
+
+    await dispatchDue(
+      repo as unknown as Repository,
+      {
+        token: "pushplus-token",
+        topic: "pushplus-topic",
+        callbackSecret: secret,
+        callbackBaseUrl: "https://worker.test"
+      },
+      () => current,
+      fetchImpl
+    );
+
+    expect(repo.prepareDispatchClaim).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(repo.expireOrRequeueClaim).toHaveBeenCalledWith(
+      event.id,
+      event.attemptCount,
+      expect.any(String),
+      boundaryNow
+    );
   });
 });

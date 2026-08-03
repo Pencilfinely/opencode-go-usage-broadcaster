@@ -177,4 +177,66 @@ describe("scheduled orchestration", () => {
     }>();
     expect(job).toEqual({ status: "failed", error_kind: "internal" });
   });
+
+  it("classifies a non-object injected snapshot as a schema failure", async () => {
+    const source: QuotaSource = {
+      fetch: vi.fn().mockResolvedValue(undefined as unknown as QuotaSnapshot)
+    };
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(AT_0900),
+        cron: "*/30 * * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      {
+        source,
+        now: () => AT_0900,
+        fetchImpl: vi.fn().mockResolvedValue(
+          Response.json({ code: 200, data: "provider-id" })
+        )
+      }
+    );
+
+    expect(await env.DB.prepare(
+      "SELECT status, error_kind FROM job_runs WHERE job_key = ?"
+    ).bind("regular:" + AT_0900).first()).toEqual({
+      status: "failed",
+      error_kind: "schema"
+    });
+  });
+
+  it("classifies an unknown window status as a schema failure", async () => {
+    const malformed = snapshot(20, AT_0900) as unknown as {
+      windows: { rolling: { status: string } };
+    };
+    malformed.windows.rolling.status = "unexpected";
+    const source: QuotaSource = {
+      fetch: vi.fn().mockResolvedValue(malformed as unknown as QuotaSnapshot)
+    };
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(AT_0900),
+        cron: "*/30 * * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      {
+        source,
+        now: () => AT_0900,
+        fetchImpl: vi.fn().mockResolvedValue(
+          Response.json({ code: 200, data: "provider-id" })
+        )
+      }
+    );
+
+    expect(await env.DB.prepare(
+      "SELECT status, error_kind FROM job_runs WHERE job_key = ?"
+    ).bind("regular:" + AT_0900).first()).toEqual({
+      status: "failed",
+      error_kind: "schema"
+    });
+  });
 });

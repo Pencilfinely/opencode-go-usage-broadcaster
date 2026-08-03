@@ -56,12 +56,83 @@ describe("D1 repository", () => {
       repo.claimDueEvent("dispatcher-b", now, 60_000)
     ]);
     expect(claims.filter(Boolean)).toHaveLength(1);
-    await repo.markAttemptFailure("event-1", 1, now + 1, now + 2);
+    const claim = claims.find((value) => value !== null)!;
+    await repo.markAttemptFailure(
+      "event-1",
+      1,
+      claim.leaseOwner,
+      now + 1,
+      now + 2
+    );
     expect(
       await env.DB.prepare(
         "SELECT status, next_attempt_at FROM outbox_events WHERE id = 'event-1'"
       ).first()
     ).toEqual({ status: "retryable", next_attempt_at: now + 2 });
+  });
+
+  it("creates the matching attempt within the claim update", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T01:30:00Z");
+    expect(await repo.acquireSnapshotLease("trigger-owner", now, 90_000)).toBe(true);
+    await repo.enqueueEventsUnderLease("trigger-owner", now, [{
+      id: "event-trigger-claim",
+      logicalKey: "startup:trigger-claim",
+      kind: "startup",
+      title: "title",
+      content: "content",
+      notAfter: now + 86_400_000,
+      triggers: []
+    }]);
+
+    await env.DB.prepare(
+      "UPDATE outbox_events SET status = 'sending', lease_owner = ?, " +
+      "lease_until = ?, attempt_count = attempt_count + 1, updated_at = ? " +
+      "WHERE id = ?"
+    ).bind("dispatcher", now + 60_000, now, "event-trigger-claim").run();
+
+    expect(await env.DB.prepare(
+      "SELECT attempt_no, status, created_at, updated_at FROM outbox_attempts " +
+      "WHERE event_id = ?"
+    ).bind("event-trigger-claim").first()).toEqual({
+      attempt_no: 1,
+      status: "sending",
+      created_at: now,
+      updated_at: now
+    });
+  });
+
+  it("rolls back a claim when atomic attempt insertion conflicts", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T01:45:00Z");
+    expect(await repo.acquireSnapshotLease("conflict-owner", now, 90_000)).toBe(true);
+    await repo.enqueueEventsUnderLease("conflict-owner", now, [{
+      id: "event-conflicting-claim",
+      logicalKey: "startup:conflicting-claim",
+      kind: "startup",
+      title: "title",
+      content: "content",
+      notAfter: now + 86_400_000,
+      triggers: []
+    }]);
+    await env.DB.prepare(
+      "INSERT INTO outbox_attempts " +
+      "(event_id, attempt_no, status, created_at, updated_at) " +
+      "VALUES (?, 1, 'unknown', ?, ?)"
+    ).bind("event-conflicting-claim", now, now).run();
+
+    await expect(
+      repo.claimDueEvent("dispatcher", now, 60_000)
+    ).rejects.toThrow();
+    expect(await env.DB.prepare(
+      "SELECT status, attempt_count, lease_owner, lease_until " +
+      "FROM outbox_events WHERE id = ?"
+    ).bind("event-conflicting-claim").first()).toEqual({
+      status: "pending",
+      attempt_count: 0,
+      lease_owner: null,
+      lease_until: null
+    });
   });
 
   it("delivers accepted threshold triggers and abandons expired triggers", async () => {
@@ -109,7 +180,13 @@ describe("D1 repository", () => {
         "SELECT status FROM outbox_attempts WHERE event_id = ? AND attempt_no = ?"
       ).bind("event-success", 1).first()
     ).toEqual({ status: "sending" });
-    await repo.markAttemptAccepted("event-success", 1, "short-success", now + 1);
+    await repo.markAttemptAccepted(
+      "event-success",
+      1,
+      "dispatcher",
+      "short-success",
+      now + 1
+    );
     expect(await Promise.all([
       repo.markCallbackSuccess("event-success", "short-success", now + 2),
       repo.markCallbackSuccess("event-success", "short-success", now + 2)
@@ -174,6 +251,7 @@ describe("D1 repository", () => {
     await repo.markAttemptAccepted(
       "event-callback-expired",
       1,
+      "expiry-dispatcher",
       "short-expired",
       now + 1
     );
@@ -200,6 +278,137 @@ describe("D1 repository", () => {
         "SELECT status FROM outbox_attempts WHERE event_id = 'event-callback-expired'"
       ).first()
     ).toEqual({ status: "unknown" });
+  });
+
+  it("atomically rejects success when the callback reaches notAfter", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T02:45:00Z");
+    expect(await repo.acquireSnapshotLease("success-boundary-owner", now, 90_000))
+      .toBe(true);
+    await repo.enqueueEventsUnderLease("success-boundary-owner", now, [{
+      id: "event-success-boundary",
+      logicalKey: "threshold:success-boundary",
+      kind: "threshold",
+      title: "boundary title",
+      content: "boundary content",
+      notAfter: now + 10,
+      triggers: [{
+        window: "rolling",
+        cycleKey: "success-boundary-cycle",
+        threshold: 50,
+        usedPercent: 55,
+        resetAt: "2026-08-03T05:00:00Z"
+      }]
+    }]);
+    const claim = await repo.claimDueEvent("success-boundary-dispatcher", now, 60_000);
+    expect(claim).toMatchObject({ id: "event-success-boundary", attemptCount: 1 });
+    await repo.markAttemptAccepted(
+      "event-success-boundary",
+      1,
+      "success-boundary-dispatcher",
+      "short-success-boundary",
+      now + 1
+    );
+
+    expect(await repo.markCallbackSuccess(
+      "event-success-boundary",
+      "short-success-boundary",
+      now + 10
+    )).toBe(false);
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_events WHERE id = ?"
+    ).bind("event-success-boundary").first()).toEqual({ status: "waiting_callback" });
+    expect(await env.DB.prepare(
+      "SELECT state FROM event_triggers WHERE event_id = ?"
+    ).bind("event-success-boundary").first()).toEqual({ state: "reserved" });
+  });
+
+  it("atomically rejects failure when the callback reaches notAfter", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T02:47:00Z");
+    expect(await repo.acquireSnapshotLease("failure-boundary-owner", now, 90_000))
+      .toBe(true);
+    await repo.enqueueEventsUnderLease("failure-boundary-owner", now, [{
+      id: "event-failure-boundary",
+      logicalKey: "threshold:failure-boundary",
+      kind: "threshold",
+      title: "boundary title",
+      content: "boundary content",
+      notAfter: now + 10,
+      triggers: [{
+        window: "weekly",
+        cycleKey: "failure-boundary-cycle",
+        threshold: 50,
+        usedPercent: 55,
+        resetAt: "2026-08-10T00:00:00Z"
+      }]
+    }]);
+    await repo.claimDueEvent("failure-boundary-dispatcher", now, 60_000);
+    await repo.markAttemptAccepted(
+      "event-failure-boundary",
+      1,
+      "failure-boundary-dispatcher",
+      "short-failure-boundary",
+      now + 1
+    );
+
+    expect(await repo.markCallbackFailure(
+      "event-failure-boundary",
+      "short-failure-boundary",
+      now + 10,
+      now + 20
+    )).toBe(false);
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_events WHERE id = ?"
+    ).bind("event-failure-boundary").first()).toEqual({ status: "waiting_callback" });
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_attempts WHERE event_id = ?"
+    ).bind("event-failure-boundary").first()).toEqual({ status: "accepted" });
+    expect(await env.DB.prepare(
+      "SELECT state FROM event_triggers WHERE event_id = ?"
+    ).bind("event-failure-boundary").first()).toEqual({ state: "reserved" });
+  });
+
+  it("requeues a matching claim at its lease boundary", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T02:50:00Z");
+    expect(await repo.acquireSnapshotLease("stale-boundary-owner", now, 90_000))
+      .toBe(true);
+    await repo.enqueueEventsUnderLease("stale-boundary-owner", now, [{
+      id: "event-stale-boundary",
+      logicalKey: "startup:stale-boundary",
+      kind: "startup",
+      title: "boundary title",
+      content: "boundary content",
+      notAfter: now + 86_400_000,
+      triggers: []
+    }]);
+    const claim = await repo.claimDueEvent("stale-dispatcher", now, 60_000);
+    expect(claim).toMatchObject({
+      id: "event-stale-boundary",
+      attemptCount: 1,
+      leaseOwner: "stale-dispatcher",
+      leaseUntil: now + 60_000
+    });
+
+    expect(await repo.expireOrRequeueClaim(
+      "event-stale-boundary",
+      1,
+      "stale-dispatcher",
+      now + 60_000
+    )).toBe(true);
+    expect(await env.DB.prepare(
+      "SELECT status, attempt_count, lease_owner, lease_until " +
+      "FROM outbox_events WHERE id = ?"
+    ).bind("event-stale-boundary").first()).toEqual({
+      status: "retryable",
+      attempt_count: 1,
+      lease_owner: null,
+      lease_until: null
+    });
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_attempts WHERE event_id = ? AND attempt_no = 1"
+    ).bind("event-stale-boundary").first()).toEqual({ status: "unknown" });
   });
 
   it("commits state and events only under a live lease and finalizes a started job", async () => {
@@ -357,7 +566,13 @@ describe("D1 repository", () => {
       id: "event-retry",
       attemptCount: 1
     });
-    await repo.markAttemptAccepted("event-retry", 1, "short-old", now + 1);
+    await repo.markAttemptAccepted(
+      "event-retry",
+      1,
+      "attempt-1",
+      "short-old",
+      now + 1
+    );
     const callbackDeadline = now + 30 * 60 * 1000 + 1;
     await repo.requeueStaleDeliveries(callbackDeadline);
     expect(await repo.markCallbackFailure(
@@ -388,6 +603,7 @@ describe("D1 repository", () => {
     await repo.markAttemptAccepted(
       "event-retry",
       2,
+      "attempt-2",
       "short-current",
       callbackDeadline + 4
     );

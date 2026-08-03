@@ -140,6 +140,9 @@ revisiting it.
 ## Message semantics
 
 Threshold jumps are coalesced: if a window rises from 49% to 76%, 50% and 75%
-are reserved but only the 75% notification is reported. Events expire daily,
-and PushPlus delivery has at most three attempts. Fixture-originated messages
+are reserved but only the 75% notification is reported. Expiry is per event:
+daily summaries expire at the next Shanghai midnight; threshold and startup
+events expire at the earliest relevant quota reset or after 24 hours, whichever
+comes first; and fault/recovery events expire after 24 hours. PushPlus delivery
+has at most three attempts. Fixture-originated messages
 always display the visible `【测试数据】` prefix.

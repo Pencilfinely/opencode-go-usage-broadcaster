@@ -197,7 +197,19 @@ function fixturePrefix(sourceName: "fixture" | "opencode-console"): string {
   return sourceName === "fixture" ? "【测试数据】" : "";
 }
 
-function validateSnapshot(snapshot: QuotaSnapshot): number {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function validateSnapshot(snapshot: unknown): number {
+  if (
+    !isRecord(snapshot) ||
+    snapshot.source !== "fixture" ||
+    typeof snapshot.observedAt !== "string" ||
+    !isRecord(snapshot.windows)
+  ) {
+    throw new SourceError("schema", "snapshot is invalid");
+  }
   const observedAt = Date.parse(snapshot.observedAt);
   if (!Number.isFinite(observedAt)) {
     throw new SourceError("schema", "snapshot observedAt is invalid");
@@ -205,10 +217,13 @@ function validateSnapshot(snapshot: QuotaSnapshot): number {
   for (const key of WINDOW_KEYS) {
     const window = snapshot.windows[key];
     if (
-      !window ||
+      !isRecord(window) ||
+      (window.status !== "ok" && window.status !== "rate-limited") ||
+      typeof window.usedPercent !== "number" ||
       !Number.isFinite(window.usedPercent) ||
       window.usedPercent < 0 ||
       window.usedPercent > 100 ||
+      typeof window.resetAt !== "string" ||
       !Number.isFinite(Date.parse(window.resetAt))
     ) {
       throw new SourceError("schema", "snapshot window is invalid");
@@ -273,7 +288,8 @@ export async function runScheduled(
   void ctx;
   const config = loadConfig(env);
   const repo = new Repository(env.DB);
-  const now = deps.now?.() ?? Date.now();
+  const clock = deps.now ?? Date.now;
+  const now = clock();
   const scheduledAt = new Date(controller.scheduledTime).getTime();
   if (!Number.isFinite(scheduledAt)) {
     throw new Error("scheduledTime must be finite");
@@ -282,7 +298,7 @@ export async function runScheduled(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? defaultSleep;
 
-  await dispatchDue(repo, config.pushplus, now, fetchImpl);
+  await dispatchDue(repo, config.pushplus, clock, fetchImpl);
   try {
     const owner = crypto.randomUUID();
     const acquired = await repo.acquireSnapshotLease(
@@ -541,6 +557,6 @@ export async function runScheduled(
       await repo.releaseSnapshotLease(owner);
     }
   } finally {
-    await dispatchDue(repo, config.pushplus, now, fetchImpl);
+    await dispatchDue(repo, config.pushplus, clock, fetchImpl);
   }
 }

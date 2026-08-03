@@ -63,12 +63,13 @@ export async function verifyCallback(
 export async function dispatchDue(
   repo: Repository,
   config: AppConfig["pushplus"],
-  now: number,
+  clock: () => number = Date.now,
   fetchImpl: typeof fetch = fetch
 ): Promise<void> {
   for (let sent = 0; sent < 5; sent += 1) {
     const owner = crypto.randomUUID();
-    const event = await repo.claimDueEvent(owner, now, 60_000);
+    const claimNow = clock();
+    const event = await repo.claimDueEvent(owner, claimNow, 60_000);
     if (!event) return;
     const signature = await signCallback(
       config.callbackSecret,
@@ -83,6 +84,44 @@ export async function dispatchDue(
       event.notAfter +
       "/" +
       signature;
+
+    const prepareNow = clock();
+    if (event.notAfter <= prepareNow || event.leaseUntil <= prepareNow) {
+      await repo.expireOrRequeueClaim(
+        event.id,
+        event.attemptCount,
+        event.leaseOwner,
+        prepareNow
+      );
+      return;
+    }
+    const renewedLeaseUntil = await repo.prepareDispatchClaim(
+      event.id,
+      event.attemptCount,
+      event.leaseOwner,
+      prepareNow,
+      60_000
+    );
+    if (renewedLeaseUntil === null) {
+      await repo.expireOrRequeueClaim(
+        event.id,
+        event.attemptCount,
+        event.leaseOwner,
+        clock()
+      );
+      return;
+    }
+
+    const sendNow = clock();
+    if (event.notAfter <= sendNow || renewedLeaseUntil <= sendNow) {
+      await repo.expireOrRequeueClaim(
+        event.id,
+        event.attemptCount,
+        event.leaseOwner,
+        sendNow
+      );
+      return;
+    }
     try {
       const response = await fetchImpl(PUSHPLUS_URL, {
         method: "POST",
@@ -107,19 +146,39 @@ export async function dispatchDue(
       if (result.code !== 200 || !result.data) {
         throw new Error("pushplus_rejected");
       }
-      await repo.markAttemptAccepted(
+      const responseNow = clock();
+      const accepted = await repo.markAttemptAccepted(
         event.id,
         event.attemptCount,
+        event.leaseOwner,
         result.data,
-        now
+        responseNow
       );
+      if (!accepted) {
+        await repo.expireOrRequeueClaim(
+          event.id,
+          event.attemptCount,
+          event.leaseOwner,
+          responseNow
+        );
+      }
     } catch {
-      await repo.markAttemptFailure(
+      const failureNow = clock();
+      const failed = await repo.markAttemptFailure(
         event.id,
         event.attemptCount,
-        now,
-        now + RETRY_DELAY_MS
+        event.leaseOwner,
+        failureNow,
+        failureNow + RETRY_DELAY_MS
       );
+      if (!failed) {
+        await repo.expireOrRequeueClaim(
+          event.id,
+          event.attemptCount,
+          event.leaseOwner,
+          failureNow
+        );
+      }
     }
   }
 }
@@ -168,7 +227,8 @@ function notFound(): Response {
 export async function handlePushPlusCallback(
   request: Request,
   config: Pick<AppConfig["pushplus"], "callbackSecret">,
-  repo: Pick<Repository, "markCallbackSuccess" | "markCallbackFailure">
+  repo: Pick<Repository, "markCallbackSuccess" | "markCallbackFailure">,
+  clock: () => number = Date.now
 ): Promise<Response> {
   if (request.method !== "POST") return notFound();
 
@@ -194,8 +254,7 @@ export async function handlePushPlusCallback(
   if (!eventId || !/^\d+$/u.test(segments[4])) return notFound();
 
   const expires = Number(segments[4]);
-  const now = Date.now();
-  if (!Number.isSafeInteger(expires) || expires <= now) return notFound();
+  if (!Number.isSafeInteger(expires) || expires <= clock()) return notFound();
   if (
     !await verifyCallback(
       config.callbackSecret,
@@ -242,13 +301,19 @@ export async function handlePushPlusCallback(
     return notFound();
   }
 
+  const transitionNow = clock();
+  if (expires <= transitionNow) return notFound();
   const transitioned = messageInfo.sendStatus === 2
-    ? await repo.markCallbackSuccess(eventId, messageInfo.shortCode, now)
+    ? await repo.markCallbackSuccess(
+        eventId,
+        messageInfo.shortCode,
+        transitionNow
+      )
     : await repo.markCallbackFailure(
       eventId,
       messageInfo.shortCode,
-      now,
-      now + RETRY_DELAY_MS
+      transitionNow,
+      transitionNow + RETRY_DELAY_MS
     );
   if (!transitioned) return notFound();
 

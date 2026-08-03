@@ -25,6 +25,8 @@ export interface ClaimedEvent {
   content: string;
   attemptCount: number;
   notAfter: number;
+  leaseOwner: string;
+  leaseUntil: number;
 }
 
 export interface JobInput {
@@ -65,6 +67,8 @@ type EventRow = {
   content: string;
   attempt_count: number;
   not_after: number;
+  lease_owner: string;
+  lease_until: number;
 };
 
 type CallbackRow = {
@@ -262,20 +266,11 @@ export class Repository {
         "AND (lease_until IS NULL OR lease_until <= ?) " +
         "ORDER BY created_at, id LIMIT 1) " +
         "RETURNING id, logical_key, kind, title, content, " +
-        "attempt_count, not_after"
+        "attempt_count, not_after, lease_owner, lease_until"
       )
       .bind(owner, now + leaseMs, now, now, now, now)
       .first<EventRow>();
     if (!row) return null;
-
-    await this.db
-      .prepare(
-        "INSERT INTO outbox_attempts " +
-        "(event_id, attempt_no, status, created_at, updated_at) " +
-        "VALUES (?, ?, 'sending', ?, ?)"
-      )
-      .bind(row.id, row.attempt_count, now, now)
-      .run();
 
     return {
       id: row.id,
@@ -284,40 +279,109 @@ export class Repository {
       title: row.title,
       content: row.content,
       attemptCount: row.attempt_count,
-      notAfter: row.not_after
+      notAfter: row.not_after,
+      leaseOwner: row.lease_owner,
+      leaseUntil: row.lease_until
     };
+  }
+
+  async prepareDispatchClaim(
+    eventId: string,
+    attemptNo: number,
+    owner: string,
+    now: number,
+    leaseMs: number
+  ): Promise<number | null> {
+    const row = await this.db
+      .prepare(
+        "UPDATE outbox_events SET lease_until = ?, updated_at = ? " +
+        "WHERE id = ? AND status = 'sending' AND attempt_count = ? " +
+        "AND lease_owner = ? AND lease_until > ? AND not_after > ? " +
+        "RETURNING lease_until"
+      )
+      .bind(now + leaseMs, now, eventId, attemptNo, owner, now, now)
+      .first<{ lease_until: number }>();
+    return row?.lease_until ?? null;
+  }
+
+  async expireOrRequeueClaim(
+    eventId: string,
+    attemptNo: number,
+    owner: string,
+    now: number
+  ): Promise<boolean> {
+    const results = await this.db.batch([
+      this.db
+        .prepare(
+          "UPDATE outbox_events SET status = CASE " +
+          "WHEN not_after <= ? THEN 'expired' " +
+          "WHEN attempt_count < 3 THEN 'retryable' ELSE 'dead' END, " +
+          "lease_owner = NULL, lease_until = NULL, " +
+          "next_attempt_at = CASE WHEN not_after <= ? " +
+          "THEN next_attempt_at ELSE ? END, updated_at = ? " +
+          "WHERE id = ? AND status = 'sending' AND attempt_count = ? " +
+          "AND lease_owner = ? AND (not_after <= ? OR lease_until <= ?)"
+        )
+        .bind(
+          now,
+          now,
+          now,
+          now,
+          eventId,
+          attemptNo,
+          owner,
+          now,
+          now
+        ),
+      this.db
+        .prepare(
+          "UPDATE outbox_attempts SET status = 'unknown', updated_at = ? " +
+          "WHERE event_id = ? AND attempt_no = ? AND status = 'sending' " +
+          "AND EXISTS (SELECT 1 FROM outbox_events WHERE id = ? " +
+          "AND attempt_count = ? AND status IN ('retryable', 'dead', 'expired'))"
+        )
+        .bind(now, eventId, attemptNo, eventId, attemptNo),
+      this.db
+        .prepare(
+          "UPDATE event_triggers SET state = 'abandoned' " +
+          "WHERE event_id = ? AND state = 'reserved' AND EXISTS (" +
+          "SELECT 1 FROM outbox_events WHERE id = ? " +
+          "AND status IN ('dead', 'expired'))"
+        )
+        .bind(eventId, eventId)
+    ]);
+    return results[0]!.meta.changes === 1;
   }
 
   async markAttemptAccepted(
     eventId: string,
     attemptNo: number,
+    owner: string,
     shortCode: string,
     now: number
-  ): Promise<void> {
+  ): Promise<boolean> {
     const currentSending =
       "EXISTS (SELECT 1 FROM outbox_events WHERE id = ? " +
-      "AND status = 'sending' AND attempt_count = ?)";
-    await this.db.batch([
+      "AND status = 'sending' AND attempt_count = ? AND lease_owner = ? " +
+      "AND lease_until > ? AND not_after > ?)";
+    const results = await this.db.batch([
       this.db
         .prepare(
-          "INSERT INTO outbox_attempts " +
-          "(event_id, attempt_no, provider_message_id, status, created_at, updated_at) " +
-          "SELECT ?, ?, ?, 'accepted', ?, ? WHERE " + currentSending + " " +
-          "ON CONFLICT(event_id, attempt_no) DO UPDATE SET " +
-          "provider_message_id = excluded.provider_message_id, " +
-          "status = 'accepted', updated_at = excluded.updated_at " +
-          "WHERE outbox_attempts.status = 'sending' AND " + currentSending
+          "UPDATE outbox_attempts SET provider_message_id = ?, " +
+          "status = 'accepted', updated_at = ? " +
+          "WHERE event_id = ? AND attempt_no = ? AND status = 'sending' " +
+          "AND " + currentSending
         )
         .bind(
-          eventId,
-          attemptNo,
           shortCode,
           now,
-          now,
           eventId,
           attemptNo,
           eventId,
-          attemptNo
+          attemptNo,
+          owner,
+          now,
+          now
         ),
       this.db
         .prepare(
@@ -325,6 +389,7 @@ export class Repository {
           "provider_message_id = ?, lease_owner = NULL, lease_until = NULL, " +
           "next_attempt_at = ?, updated_at = ? " +
           "WHERE id = ? AND status = 'sending' AND attempt_count = ? " +
+          "AND lease_owner = ? AND lease_until > ? AND not_after > ? " +
           "AND EXISTS (SELECT 1 FROM outbox_attempts WHERE event_id = ? " +
           "AND attempt_no = ? AND provider_message_id = ? AND status = 'accepted')"
         )
@@ -334,39 +399,55 @@ export class Repository {
           now,
           eventId,
           attemptNo,
+          owner,
+          now,
+          now,
           eventId,
           attemptNo,
           shortCode
         )
     ]);
+    return results[1]!.meta.changes === 1;
   }
 
   async markAttemptFailure(
     eventId: string,
     attemptNo: number,
+    owner: string,
     now: number,
     retryAt: number
-  ): Promise<void> {
+  ): Promise<boolean> {
     const currentSending =
       "EXISTS (SELECT 1 FROM outbox_events WHERE id = ? " +
-      "AND status = 'sending' AND attempt_count = ?)";
-    await this.db.batch([
+      "AND status = 'sending' AND attempt_count = ? AND lease_owner = ? " +
+      "AND lease_until > ? AND not_after > ?)";
+    const results = await this.db.batch([
       this.db
         .prepare(
           "UPDATE outbox_attempts SET status = 'failed', updated_at = ? " +
           "WHERE event_id = ? AND attempt_no = ? AND status = 'sending' " +
           "AND " + currentSending
         )
-        .bind(now, eventId, attemptNo, eventId, attemptNo),
+        .bind(
+          now,
+          eventId,
+          attemptNo,
+          eventId,
+          attemptNo,
+          owner,
+          now,
+          now
+        ),
       this.db
         .prepare(
           "UPDATE outbox_events SET status = CASE " +
           "WHEN attempt_count < 3 AND not_after > ? THEN 'retryable' " +
           "ELSE 'dead' END, lease_owner = NULL, lease_until = NULL, " +
           "next_attempt_at = ?, updated_at = ? " +
-          "WHERE id = ? AND status = 'sending' AND attempt_count = ?"
+          "WHERE id = ? AND status = 'sending' AND attempt_count = ? " +
+          "AND lease_owner = ? AND lease_until > ? AND not_after > ?"
         )
-        .bind(now, retryAt, now, eventId, attemptNo),
+        .bind(now, retryAt, now, eventId, attemptNo, owner, now, now),
       this.db
         .prepare(
           "UPDATE event_triggers SET state = 'abandoned' " +
@@ -375,6 +456,7 @@ export class Repository {
         )
         .bind(eventId, eventId)
     ]);
+    return results[1]!.meta.changes === 1;
   }
 
   async markCallbackSuccess(
@@ -396,10 +478,11 @@ export class Repository {
           "lease_owner = NULL, lease_until = NULL, updated_at = ? " +
           "WHERE id = ? AND status IN " +
           "('pending', 'sending', 'waiting_callback', 'retryable') " +
+          "AND not_after > ? " +
           "AND EXISTS (SELECT 1 FROM outbox_attempts WHERE event_id = ? " +
           "AND provider_message_id = ?)"
         )
-        .bind(now, eventId, eventId, shortCode),
+        .bind(now, eventId, now, eventId, shortCode),
       this.db
         .prepare(
           "UPDATE outbox_attempts SET status = 'succeeded', updated_at = ? " +
@@ -445,9 +528,10 @@ export class Repository {
           "WHERE event_id = ? AND provider_message_id = ? " +
           "AND status <> 'succeeded' AND EXISTS (" +
           "SELECT 1 FROM outbox_events WHERE id = outbox_attempts.event_id " +
-          "AND status IN ('pending', 'sending', 'waiting_callback', 'retryable'))"
+          "AND status IN ('pending', 'sending', 'waiting_callback', 'retryable') " +
+          "AND not_after > ?)"
         )
-        .bind(now, eventId, shortCode),
+        .bind(now, eventId, shortCode, now),
       this.db
         .prepare(
           "UPDATE outbox_events SET status = CASE " +
@@ -456,6 +540,7 @@ export class Repository {
           "next_attempt_at = ?, updated_at = ? " +
           "WHERE id = ? AND attempt_count = ? " +
           "AND status IN ('sending', 'waiting_callback') " +
+          "AND not_after > ? " +
           "AND EXISTS (SELECT 1 FROM outbox_attempts WHERE event_id = ? " +
           "AND attempt_no = ? AND provider_message_id = ? AND status = 'failed')"
         )
@@ -465,6 +550,7 @@ export class Repository {
           now,
           eventId,
           row.attempt_no,
+          now,
           eventId,
           row.attempt_no,
           shortCode
