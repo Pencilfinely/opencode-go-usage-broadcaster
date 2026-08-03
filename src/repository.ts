@@ -428,7 +428,11 @@ export class Repository {
     retryAt: number
   ): Promise<boolean> {
     const row = await this.callbackRow(eventId, shortCode);
-    if (!row || row.attempt_status === "succeeded" || row.event_status === "succeeded") {
+    if (
+      !row ||
+      row.attempt_status === "succeeded" ||
+      !this.isActiveStatus(row.event_status)
+    ) {
       return false;
     }
     const mayChangeEvent =
@@ -439,7 +443,9 @@ export class Repository {
         .prepare(
           "UPDATE outbox_attempts SET status = 'failed', updated_at = ? " +
           "WHERE event_id = ? AND provider_message_id = ? " +
-          "AND status <> 'succeeded'"
+          "AND status <> 'succeeded' AND EXISTS (" +
+          "SELECT 1 FROM outbox_events WHERE id = outbox_attempts.event_id " +
+          "AND status IN ('pending', 'sending', 'waiting_callback', 'retryable'))"
         )
         .bind(now, eventId, shortCode),
       this.db

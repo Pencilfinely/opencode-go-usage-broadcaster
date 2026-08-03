@@ -147,6 +147,61 @@ describe("D1 repository", () => {
     expect(await repo.isEventSucceeded("event-expired")).toBe(false);
   });
 
+  it("rejects a known failure callback after the event expires", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T02:30:00Z");
+    expect(await repo.acquireSnapshotLease("expiry-owner", now, 90_000)).toBe(true);
+    await repo.enqueueEventsUnderLease("expiry-owner", now, [{
+      id: "event-callback-expired",
+      logicalKey: "threshold:callback-expired",
+      kind: "threshold",
+      title: "expires while waiting",
+      content: "expires while waiting",
+      notAfter: now + 10,
+      triggers: [{
+        window: "monthly",
+        cycleKey: "callback-expired-cycle",
+        threshold: 50,
+        usedPercent: 55,
+        resetAt: "2026-09-01T00:00:00Z"
+      }]
+    }]);
+
+    expect(await repo.claimDueEvent("expiry-dispatcher", now, 60_000)).toMatchObject({
+      id: "event-callback-expired",
+      attemptCount: 1
+    });
+    await repo.markAttemptAccepted(
+      "event-callback-expired",
+      1,
+      "short-expired",
+      now + 1
+    );
+    await repo.expireDueEvents(now + 10);
+
+    expect(await repo.markCallbackFailure(
+      "event-callback-expired",
+      "short-expired",
+      now + 11,
+      now + 12
+    )).toBe(false);
+    expect(
+      await env.DB.prepare(
+        "SELECT status FROM outbox_events WHERE id = 'event-callback-expired'"
+      ).first()
+    ).toEqual({ status: "expired" });
+    expect(
+      await env.DB.prepare(
+        "SELECT state FROM event_triggers WHERE event_id = 'event-callback-expired'"
+      ).first()
+    ).toEqual({ state: "abandoned" });
+    expect(
+      await env.DB.prepare(
+        "SELECT status FROM outbox_attempts WHERE event_id = 'event-callback-expired'"
+      ).first()
+    ).toEqual({ status: "unknown" });
+  });
+
   it("commits state and events only under a live lease and finalizes a started job", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T03:00:00Z");
