@@ -556,6 +556,62 @@ describe("D1 repository", () => {
     ).toEqual({ status: "started" });
   });
 
+  it("旧接口接受响应不能终结已被新租约领取的尝试", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-03T03:50:00Z");
+    expect(await repo.acquireSnapshotLease("race-owner", now, 90_000)).toBe(true);
+    await repo.enqueueEventsUnderLease("race-owner", now, [{
+      id: "event-old-accept",
+      logicalKey: "threshold:old-accept",
+      kind: "threshold",
+      title: "旧响应竞态",
+      content: "旧响应不能覆盖新尝试",
+      notAfter: now + 86_400_000,
+      triggers: [{
+        window: "monthly",
+        cycleKey: "monthly-cycle-old-accept",
+        threshold: 90,
+        usedPercent: 95,
+        resetAt: "2026-09-01T00:00:00Z"
+      }]
+    }]);
+
+    expect(await repo.claimDueEvent("old-owner", now, 60_000)).toMatchObject({
+      id: "event-old-accept",
+      attemptCount: 1
+    });
+    await repo.requeueStaleDeliveries(now + 60_000);
+    expect(await repo.claimDueEvent("new-owner", now + 60_000, 60_000))
+      .toMatchObject({ id: "event-old-accept", attemptCount: 2 });
+
+    expect(await repo.markAttemptAccepted(
+      "event-old-accept",
+      1,
+      "old-owner",
+      "short-old",
+      now + 60_001
+    )).toBe(false);
+    expect(await env.DB.prepare(
+      "SELECT status, attempt_count, lease_owner FROM outbox_events WHERE id = ?"
+    ).bind("event-old-accept").first()).toEqual({
+      status: "sending",
+      attempt_count: 2,
+      lease_owner: "new-owner"
+    });
+    expect(await env.DB.prepare(
+      "SELECT attempt_no, status FROM outbox_attempts WHERE event_id = ? " +
+      "ORDER BY attempt_no"
+    ).bind("event-old-accept").all()).toMatchObject({
+      results: [
+        { attempt_no: 1, status: "unknown" },
+        { attempt_no: 2, status: "sending" }
+      ]
+    });
+    expect(await env.DB.prepare(
+      "SELECT state FROM event_triggers WHERE event_id = ?"
+    ).bind("event-old-accept").first()).toEqual({ state: "reserved" });
+  });
+
   it("失败重试达到上限后不再领取事件", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T04:00:00Z");
