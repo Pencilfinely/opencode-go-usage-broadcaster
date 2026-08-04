@@ -137,7 +137,7 @@ describe("D1 repository", () => {
     });
   });
 
-  it("delivers accepted threshold triggers and abandons expired triggers", async () => {
+  it("接口接受后立即终结阈值事件并废弃过期触发条件", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T02:00:00Z");
     expect(await repo.acquireSnapshotLease("transition-owner", now, 90_000)).toBe(true);
@@ -189,10 +189,22 @@ describe("D1 repository", () => {
       "short-success",
       now + 1
     );
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_events WHERE id = 'event-success'"
+    ).first()).toEqual({ status: "succeeded" });
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_attempts WHERE event_id = 'event-success'"
+    ).first()).toEqual({ status: "succeeded" });
     expect(await Promise.all([
       repo.markCallbackSuccess("event-success", "short-success", now + 2),
       repo.markCallbackSuccess("event-success", "short-success", now + 2)
     ])).toEqual([true, true]);
+    expect(await repo.markCallbackFailure(
+      "event-success",
+      "short-success",
+      now + 3,
+      now + 4
+    )).toBe(false);
     expect(await repo.markCallbackSuccess("event-success", "unknown", now + 3)).toBe(false);
     expect(await repo.markCallbackFailure(
       "event-success",
@@ -226,7 +238,7 @@ describe("D1 repository", () => {
     expect(await repo.isEventSucceeded("event-expired")).toBe(false);
   });
 
-  it("rejects a known failure callback after the event expires", async () => {
+  it("接口接受后即使超过有效期也拒绝失败回调", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T02:30:00Z");
     expect(await repo.acquireSnapshotLease("expiry-owner", now, 90_000)).toBe(true);
@@ -269,20 +281,20 @@ describe("D1 repository", () => {
       await env.DB.prepare(
         "SELECT status FROM outbox_events WHERE id = 'event-callback-expired'"
       ).first()
-    ).toEqual({ status: "expired" });
+    ).toEqual({ status: "succeeded" });
     expect(
       await env.DB.prepare(
         "SELECT state FROM event_triggers WHERE event_id = 'event-callback-expired'"
       ).first()
-    ).toEqual({ state: "abandoned" });
+    ).toEqual({ state: "delivered" });
     expect(
       await env.DB.prepare(
         "SELECT status FROM outbox_attempts WHERE event_id = 'event-callback-expired'"
       ).first()
-    ).toEqual({ status: "unknown" });
+    ).toEqual({ status: "succeeded" });
   });
 
-  it("atomically rejects success when the callback reaches notAfter", async () => {
+  it("接口接受后成功回调保持幂等", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T02:45:00Z");
     expect(await repo.acquireSnapshotLease("success-boundary-owner", now, 90_000))
@@ -316,16 +328,16 @@ describe("D1 repository", () => {
       "event-success-boundary",
       "short-success-boundary",
       now + 10
-    )).toBe(false);
+    )).toBe(true);
     expect(await env.DB.prepare(
       "SELECT status FROM outbox_events WHERE id = ?"
-    ).bind("event-success-boundary").first()).toEqual({ status: "waiting_callback" });
+    ).bind("event-success-boundary").first()).toEqual({ status: "succeeded" });
     expect(await env.DB.prepare(
       "SELECT state FROM event_triggers WHERE event_id = ?"
-    ).bind("event-success-boundary").first()).toEqual({ state: "reserved" });
+    ).bind("event-success-boundary").first()).toEqual({ state: "delivered" });
   });
 
-  it("atomically rejects failure when the callback reaches notAfter", async () => {
+  it("接口接受后失败回调不能回退状态", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T02:47:00Z");
     expect(await repo.acquireSnapshotLease("failure-boundary-owner", now, 90_000))
@@ -362,13 +374,13 @@ describe("D1 repository", () => {
     )).toBe(false);
     expect(await env.DB.prepare(
       "SELECT status FROM outbox_events WHERE id = ?"
-    ).bind("event-failure-boundary").first()).toEqual({ status: "waiting_callback" });
+    ).bind("event-failure-boundary").first()).toEqual({ status: "succeeded" });
     expect(await env.DB.prepare(
       "SELECT status FROM outbox_attempts WHERE event_id = ?"
-    ).bind("event-failure-boundary").first()).toEqual({ status: "accepted" });
+    ).bind("event-failure-boundary").first()).toEqual({ status: "succeeded" });
     expect(await env.DB.prepare(
       "SELECT state FROM event_triggers WHERE event_id = ?"
-    ).bind("event-failure-boundary").first()).toEqual({ state: "reserved" });
+    ).bind("event-failure-boundary").first()).toEqual({ state: "delivered" });
   });
 
   it("requeues a matching claim at its lease boundary", async () => {
@@ -544,7 +556,7 @@ describe("D1 repository", () => {
     ).toEqual({ status: "started" });
   });
 
-  it("recovers stale deliveries, caps claims, and ignores an old failure callback", async () => {
+  it("失败重试达到上限后不再领取事件", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T04:00:00Z");
     expect(await repo.acquireSnapshotLease("retry-owner", now, 90_000)).toBe(true);
@@ -568,64 +580,43 @@ describe("D1 repository", () => {
       id: "event-retry",
       attemptCount: 1
     });
-    await repo.markAttemptAccepted(
+    expect(await repo.markAttemptFailure(
       "event-retry",
       1,
       "attempt-1",
-      "short-old",
-      now + 1
-    );
-    const callbackDeadline = now + 30 * 60 * 1000 + 1;
-    await repo.requeueStaleDeliveries(callbackDeadline);
-    expect(await repo.markCallbackFailure(
-      "event-retry",
-      "short-old",
-      callbackDeadline + 1,
-      callbackDeadline + 2
+      now + 1,
+      now + 2
     )).toBe(true);
     expect(await repo.claimDueEvent(
       "attempt-2",
-      callbackDeadline + 2,
+      now + 2,
       60_000
     )).toMatchObject({
       attemptCount: 2
     });
-    expect(await repo.markCallbackFailure(
+    expect(await repo.markAttemptFailure(
       "event-retry",
-      "short-old",
-      callbackDeadline + 3,
-      callbackDeadline + 4
+      2,
+      "attempt-2",
+      now + 3,
+      now + 4
     )).toBe(true);
     expect(
       await env.DB.prepare(
         "SELECT status, attempt_count FROM outbox_events WHERE id = 'event-retry'"
       ).first()
-    ).toEqual({ status: "sending", attempt_count: 2 });
-
-    await repo.markAttemptAccepted(
-      "event-retry",
-      2,
-      "attempt-2",
-      "short-current",
-      callbackDeadline + 4
-    );
-    expect(await repo.markCallbackFailure(
-      "event-retry",
-      "short-current",
-      callbackDeadline + 5,
-      callbackDeadline + 6
-    )).toBe(true);
+    ).toEqual({ status: "retryable", attempt_count: 2 });
     expect(await repo.claimDueEvent(
       "attempt-3",
-      callbackDeadline + 6,
+      now + 4,
       60_000
     )).toMatchObject({
       attemptCount: 3
     });
-    await repo.requeueStaleDeliveries(callbackDeadline + 60_007);
+    await repo.requeueStaleDeliveries(now + 60_004);
     expect(await repo.claimDueEvent(
       "attempt-4",
-      callbackDeadline + 60_008,
+      now + 60_005,
       60_000
     )).toBeNull();
     expect(

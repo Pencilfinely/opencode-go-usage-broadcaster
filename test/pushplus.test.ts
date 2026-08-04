@@ -281,7 +281,7 @@ describe("PushPlus callback", () => {
 });
 
 describe("PushPlus dispatch", () => {
-  it("posts a signed fixed-shape payload and records provider acceptance", async () => {
+  it("发送带签名的固定结构载荷并记录服务商接受结果", async () => {
     const event = claimedEvent();
     const repo = dispatchRepository([event]);
     const fetchImpl = vi.fn(async (
