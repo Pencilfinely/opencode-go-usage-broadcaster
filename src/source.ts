@@ -143,49 +143,51 @@ export class OpenCodeConsoleQuotaSource implements QuotaSource {
     const request = validateOpenCodeRequest(this.bundle.request);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
-    let response: Response;
     try {
-      response = await this.fetchImpl(request.url, {
-        method: request.method,
-        headers: { ...request.headers, cookie: this.bundle.auth.cookie },
-        ...(request.body === undefined ? {} : { body: request.body }),
-        redirect: "manual",
-        signal: controller.signal
-      });
-    } catch {
-      throw new SourceError("transient", "OpenCode 请求失败或超时");
+      let response: Response;
+      try {
+        response = await this.fetchImpl(request.url, {
+          method: request.method,
+          headers: { ...request.headers, cookie: this.bundle.auth.cookie },
+          ...(request.body === undefined ? {} : { body: request.body }),
+          redirect: "manual",
+          signal: controller.signal
+        });
+      } catch {
+        throw new SourceError("transient", "OpenCode 请求失败或超时");
+      }
+
+      if (response.status === 401 || response.status === 403 || isLoginRedirect(response)) {
+        throw new SourceError("auth", "OpenCode 会话已失效");
+      }
+      if (response.status === 429 || response.status === 408 || response.status >= 500) {
+        throw new SourceError("transient", "OpenCode 服务暂时不可用");
+      }
+      if (!response.ok) {
+        throw new SourceError("schema", "OpenCode 响应状态无效");
+      }
+
+      let text: string;
+      try {
+        text = await readLimitedText(response);
+      } catch (error) {
+        if (error instanceof SourceError) throw error;
+        throw new SourceError("transient", "OpenCode 响应读取失败");
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        throw new SourceError("schema", "OpenCode 响应不是有效 JSON");
+      }
+      return {
+        source: "opencode-console",
+        observedAt: now.toISOString(),
+        windows: normalizeOpenCodeUsage(payload, now)
+      };
     } finally {
       clearTimeout(timer);
     }
-
-    if (response.status === 401 || response.status === 403 || isLoginRedirect(response)) {
-      throw new SourceError("auth", "OpenCode 会话已失效");
-    }
-    if (response.status === 429 || response.status === 408 || response.status >= 500) {
-      throw new SourceError("transient", "OpenCode 服务暂时不可用");
-    }
-    if (!response.ok) {
-      throw new SourceError("schema", "OpenCode 响应状态无效");
-    }
-
-    let text: string;
-    try {
-      text = await readLimitedText(response);
-    } catch (error) {
-      if (error instanceof SourceError) throw error;
-      throw new SourceError("transient", "OpenCode 响应读取失败");
-    }
-    let payload: unknown;
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      throw new SourceError("schema", "OpenCode 响应不是有效 JSON");
-    }
-    return {
-      source: "opencode-console",
-      observedAt: now.toISOString(),
-      windows: normalizeOpenCodeUsage(payload, now)
-    };
   }
 }
 

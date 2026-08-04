@@ -93,4 +93,42 @@ describe("OpenCode 控制台采集器", () => {
     });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it("将响应体读取纳入十秒超时", async () => {
+    vi.useFakeTimers();
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let bodyReading!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      bodyReading = resolve;
+    });
+    const fetchImpl = vi.fn().mockImplementation((_url, init: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+          init.signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("超时", "AbortError"));
+          }, { once: true });
+          bodyReading();
+        }
+      });
+      return Promise.resolve(new Response(body));
+    });
+    const source = new OpenCodeConsoleQuotaSource(bundle(), fetchImpl);
+    const pending = source.fetch(new Date());
+    let failure: unknown;
+    void pending.catch((error: unknown) => {
+      failure = error;
+    });
+
+    try {
+      await reading;
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(failure).toMatchObject({ kind: "transient" });
+    } finally {
+      bodyController?.error(new DOMException("清理", "AbortError"));
+      await pending.catch(() => undefined);
+      vi.useRealTimers();
+    }
+  });
 });
