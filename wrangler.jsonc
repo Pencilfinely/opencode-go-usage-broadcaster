@@ -7,7 +7,7 @@
     {
       "binding": "DB",
       "database_name": "opencode-go-usage",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "3759034b-ac92-45ed-a315-f33bd1d7ac92",
       "migrations_dir": "migrations"
     }
   ],

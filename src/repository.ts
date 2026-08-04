@@ -256,20 +256,33 @@ export class Repository {
   ): Promise<ClaimedEvent | null> {
     await this.expireDueEvents(now);
     await this.requeueStaleDeliveries(now);
-    const row = await this.db
-      .prepare(
-        "UPDATE outbox_events SET status = 'sending', lease_owner = ?, " +
-        "lease_until = ?, attempt_count = attempt_count + 1, updated_at = ? " +
-        "WHERE id = (SELECT id FROM outbox_events WHERE " +
-        "status IN ('pending', 'retryable') AND attempt_count < 3 " +
-        "AND next_attempt_at <= ? AND not_after > ? " +
-        "AND (lease_until IS NULL OR lease_until <= ?) " +
-        "ORDER BY created_at, id LIMIT 1) " +
-        "RETURNING id, logical_key, kind, title, content, " +
-        "attempt_count, not_after, lease_owner, lease_until"
-      )
-      .bind(owner, now + leaseMs, now, now, now, now)
-      .first<EventRow>();
+    const leaseUntil = now + leaseMs;
+    const claimToken = crypto.randomUUID();
+    const results = await this.db.batch<EventRow>([
+      this.db
+        .prepare(
+          "UPDATE outbox_events SET status = 'sending', lease_owner = ?, " +
+          "lease_until = ?, claim_token = ?, " +
+          "attempt_count = attempt_count + 1, updated_at = ? " +
+          "WHERE id = (SELECT id FROM outbox_events WHERE " +
+          "status IN ('pending', 'retryable') AND attempt_count < 3 " +
+          "AND next_attempt_at <= ? AND not_after > ? " +
+          "AND (lease_until IS NULL OR lease_until <= ?) " +
+          "ORDER BY created_at, id LIMIT 1) " +
+          "RETURNING id, logical_key, kind, title, content, " +
+          "attempt_count, not_after, lease_owner, lease_until"
+        )
+        .bind(owner, leaseUntil, claimToken, now, now, now, now),
+      this.db
+        .prepare(
+          "INSERT INTO outbox_attempts " +
+          "(event_id, attempt_no, status, created_at, updated_at) " +
+          "SELECT id, attempt_count, 'sending', updated_at, updated_at " +
+          "FROM outbox_events WHERE claim_token = ? AND status = 'sending'"
+        )
+        .bind(claimToken)
+    ]);
+    const row = results[0]!.results[0];
     if (!row) return null;
 
     return {

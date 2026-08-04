@@ -71,7 +71,7 @@ describe("D1 repository", () => {
     ).toEqual({ status: "retryable", next_attempt_at: now + 2 });
   });
 
-  it("creates the matching attempt within the claim update", async () => {
+  it("领取事件时在同一事务中创建对应投递尝试", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T01:30:00Z");
     expect(await repo.acquireSnapshotLease("trigger-owner", now, 90_000)).toBe(true);
@@ -85,11 +85,13 @@ describe("D1 repository", () => {
       triggers: []
     }]);
 
-    await env.DB.prepare(
-      "UPDATE outbox_events SET status = 'sending', lease_owner = ?, " +
-      "lease_until = ?, attempt_count = attempt_count + 1, updated_at = ? " +
-      "WHERE id = ?"
-    ).bind("dispatcher", now + 60_000, now, "event-trigger-claim").run();
+    expect(
+      await repo.claimDueEvent("dispatcher", now, 60_000)
+    ).toMatchObject({
+      id: "event-trigger-claim",
+      attemptCount: 1,
+      leaseOwner: "dispatcher"
+    });
 
     expect(await env.DB.prepare(
       "SELECT attempt_no, status, created_at, updated_at FROM outbox_attempts " +
