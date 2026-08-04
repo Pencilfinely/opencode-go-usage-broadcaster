@@ -225,6 +225,18 @@ export function renderSummaryMessage(
   };
 }
 
+export function renderBroadcastMessage(
+  snapshot: QuotaSnapshot,
+  eventId: string,
+  manual: boolean
+): RenderedMessage {
+  return {
+    ...renderSummaryMessage(snapshot, eventId, false),
+    title: prefix(snapshot) +
+      (manual ? "OpenCode Go 手动用量" : "OpenCode Go 整点用量")
+  };
+}
+
 export function renderStartupMessage(
   snapshot: QuotaSnapshot,
   eventId: string

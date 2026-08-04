@@ -15,9 +15,7 @@ import {
 import {
   evaluateSnapshot,
   renderFaultMessage,
-  renderStartupMessage,
-  renderSummaryMessage,
-  renderThresholdMessage,
+  renderBroadcastMessage,
   type QuotaState,
   type RenderedMessage,
   type ThresholdItem
@@ -51,6 +49,10 @@ export interface AppDeps {
   now?: () => number;
 }
 
+export type BroadcastTrigger =
+  | { type: "scheduled"; occurredAt: number }
+  | { type: "manual"; occurredAt: number; idempotencyDigest: string };
+
 const EMPTY_RUNTIME: RuntimeState = {
   version: 0,
   startupCreated: false,
@@ -59,7 +61,7 @@ const EMPTY_RUNTIME: RuntimeState = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const REGULAR_SLOT_MS = 30 * 60 * 1000;
+const REGULAR_SLOT_MS = 60 * 60 * 1000;
 const SNAPSHOT_LEASE_MS = 120 * 1000;
 const FAULT_KINDS = ["auth", "transient", "schema"] as const;
 
@@ -107,12 +109,26 @@ export function shanghaiMinute(now: number): number {
   return Number(values.hour) * 60 + Number(values.minute);
 }
 
-export function nextShanghaiMidnight(now: number): number {
-  return Date.parse(shanghaiDate(now) + "T16:00:00.000Z");
+function shanghaiHour(now: number): number {
+  return Math.floor(shanghaiMinute(now) / 60);
 }
 
-function jobKind(cron: string): "regular" | "daily" {
-  return cron === "7 1 * * *" ? "daily" : "regular";
+export function isShanghaiBroadcastSlot(timestamp: number): boolean {
+  if (!Number.isFinite(timestamp)) return false;
+  const minute = shanghaiMinute(timestamp);
+  return minute % 60 === 0 && minute >= 9 * 60 && minute <= 23 * 60;
+}
+
+function nextShanghaiHour(now: number): number {
+  return (Math.floor(now / REGULAR_SLOT_MS) + 1) * REGULAR_SLOT_MS;
+}
+
+function broadcastLogicalKey(trigger: BroadcastTrigger): string {
+  if (trigger.type === "manual") {
+    return "broadcast:manual:" + trigger.idempotencyDigest;
+  }
+  return "broadcast:scheduled:" + shanghaiDate(trigger.occurredAt) + ":" +
+    String(shanghaiHour(trigger.occurredAt)).padStart(2, "0");
 }
 
 function classify(error: unknown): SourceErrorKind {
@@ -172,11 +188,6 @@ async function newEvent(
   };
 }
 
-function dailyDue(runtime: RuntimeState, now: number): boolean {
-  return shanghaiMinute(now) >= 9 * 60 + 7 &&
-    runtime.lastDailyCreatedDate !== shanghaiDate(now);
-}
-
 function faultKey(
   kind: (typeof FAULT_KINDS)[number],
   episodeId: string,
@@ -233,18 +244,6 @@ function validateSnapshot(snapshot: unknown): number {
   return observedAt;
 }
 
-function earliestReset(items: Array<{ resetAt: string }>): number {
-  return Math.min(...items.map((item) => Date.parse(item.resetAt)));
-}
-
-function thresholdLogicalKey(items: ThresholdItem[]): string {
-  const parts = items.map(
-    (item) => item.window + ":" + item.cycleKey + ":" + item.threshold
-  );
-  parts.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
-  return "threshold:" + parts.join("|");
-}
-
 async function faultEvent(
   kind: (typeof FAULT_KINDS)[number],
   episodeId: string,
@@ -287,13 +286,26 @@ export async function runScheduled(
   deps: AppDeps = {}
 ): Promise<void> {
   void ctx;
+  const scheduledAt = new Date(controller.scheduledTime).getTime();
+  if (!Number.isFinite(scheduledAt)) {
+    throw new Error("scheduledTime must be finite");
+  }
+  if (!isShanghaiBroadcastSlot(scheduledAt)) return;
+  await runBroadcast({ type: "scheduled", occurredAt: scheduledAt }, env, deps);
+}
+
+export async function runBroadcast(
+  trigger: BroadcastTrigger,
+  env: Cloudflare.Env,
+  deps: AppDeps = {}
+): Promise<"completed" | "duplicate" | "busy"> {
   const config = loadConfig(env);
   const repo = new Repository(env.DB);
   const clock = deps.now ?? Date.now;
   const now = clock();
-  const scheduledAt = new Date(controller.scheduledTime).getTime();
+  const scheduledAt = trigger.occurredAt;
   if (!Number.isFinite(scheduledAt)) {
-    throw new Error("scheduledTime must be finite");
+    throw new Error("occurredAt must be finite");
   }
   const source = deps.source ?? createQuotaSource(
     config,
@@ -310,19 +322,19 @@ export async function runScheduled(
       now,
       SNAPSHOT_LEASE_MS
     );
-    if (!acquired) return;
+    if (!acquired) return "busy";
 
     let startedJobKey: string | undefined;
     try {
-      const kind = jobKind(controller.cron);
-      const jobKey = kind + ":" + scheduledAt;
+      const kind = "regular" as const;
+      const jobKey = broadcastLogicalKey(trigger);
       if (!await repo.tryStartJob({
         key: jobKey,
         kind,
         scheduledAt,
         startedAt: now
       })) {
-        return;
+        return "duplicate";
       }
       startedJobKey = jobKey;
 
@@ -341,7 +353,7 @@ export async function runScheduled(
           states: [],
           events: []
         });
-        return;
+        return "completed";
       }
 
       if (
@@ -357,7 +369,7 @@ export async function runScheduled(
           states: [{ key: "runtime", value: runtime, version: scheduledAt }],
           events: []
         });
-        return;
+        return "completed";
       }
 
       let snapshot: QuotaSnapshot;
@@ -381,7 +393,7 @@ export async function runScheduled(
             states: [{ key: "runtime", value: runtime, version: scheduledAt }],
             events
           });
-          return;
+          return "completed";
         }
 
         if (errorKind === "auth") {
@@ -425,7 +437,9 @@ export async function runScheduled(
             events.push(warning);
           }
         } else {
-          if (kind === "regular") appendTransientSlot(runtime, scheduledAt);
+          if (trigger.type === "scheduled") {
+            appendTransientSlot(runtime, scheduledAt);
+          }
           if (
             !runtime.faults.transient &&
             runtime.transientRegularSlots.length === 3
@@ -459,61 +473,24 @@ export async function runScheduled(
           states: [{ key: "runtime", value: runtime, version: scheduledAt }],
           events
         });
-        return;
+        return "completed";
       }
 
       const evaluation = evaluateSnapshot(previousQuota, snapshot, observedAt);
       const events: NewOutboxEvent[] = [];
-      const snapshotExpiry = Math.min(
-        earliestReset(WINDOW_KEYS.map((key) => snapshot.windows[key])),
-        now + DAY_MS
-      );
 
-      if (evaluation.notifications.length > 0) {
-        const logicalKey = thresholdLogicalKey(evaluation.notifications);
-        const thresholdExpiry = Math.min(
-          earliestReset(evaluation.notifications),
-          now + DAY_MS
-        );
-        events.push(await newEvent(
-          "threshold",
-          logicalKey,
-          (eventId) => renderThresholdMessage(
-            snapshot,
-            evaluation.notifications,
-            eventId
-          ),
-          thresholdExpiry,
-          evaluation.consumptions
-        ));
-      }
-
-      if (!runtime.startupCreated) {
-        events.push(await newEvent(
-          "startup",
-          "startup:v1",
-          (eventId) => renderStartupMessage(snapshot, eventId),
-          snapshotExpiry,
-          []
-        ));
-        runtime.startupCreated = true;
-      }
-
-      if (dailyDue(runtime, now)) {
-        const date = shanghaiDate(now);
-        events.push(await newEvent(
-          "daily",
-          "daily:" + date,
-          (eventId) => renderSummaryMessage(
-            snapshot,
-            eventId,
-            kind !== "daily"
-          ),
-          nextShanghaiMidnight(now),
-          []
-        ));
-        runtime.lastDailyCreatedDate = date;
-      }
+      const logicalKey = broadcastLogicalKey(trigger);
+      events.push(await newEvent(
+        "daily",
+        logicalKey,
+        (eventId) => renderBroadcastMessage(
+          snapshot,
+          eventId,
+          trigger.type === "manual"
+        ),
+        nextShanghaiHour(now),
+        []
+      ));
 
       const prefix = fixturePrefix(config.sourceName);
       for (const faultKind of FAULT_KINDS) {
@@ -548,12 +525,13 @@ export async function runScheduled(
         ],
         events
       });
+      return "completed";
     } catch (error) {
       if (startedJobKey !== undefined) {
         try {
           await repo.markJob(startedJobKey, "failed", "internal");
         } catch {
-          // Best effort only: preserve the original post-start failure.
+          // 仅作尽力收尾，保留任务启动后的原始故障。
         }
       }
       throw error;
