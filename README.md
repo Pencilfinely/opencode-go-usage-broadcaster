@@ -53,7 +53,14 @@ curl.exe --get --data-urlencode "cron=*/30 * * * *" --data-urlencode "format=jso
    ```
 
    确认 Wrangler 只替换了 `wrangler.jsonc` 中全零的 `database_id`；若未自动替换，只手动填入该字段返回的 ID。
-3. 交互式设置 PushPlus Secret。Secret 保存在 Cloudflare Worker 的 Secret 存储中，而不在仓库、D1 或 `wrangler.jsonc`：
+3. 保持 `USAGE_SOURCE=fixture` 与 `OPENCODE_CONSOLE_ENABLED=false`，首次部署以创建 Worker 并取得 HTTPS origin：
+
+   ```powershell
+   npm run deploy
+   ```
+
+   在 Worker 已创建、但四个 PushPlus Secret 尚未设置的短暂窗口内，定时调用可能因缺少 Secret 产生错误；请立即完成下一步。此时仍为夹具来源，不会读取真实 OpenCode 会话。
+4. 交互式设置 PushPlus Secret。Secret 保存在 Cloudflare Worker 的 Secret 存储中，而不在仓库、D1 或 `wrangler.jsonc`：
 
    ```powershell
    npx wrangler secret put PUSHPLUS_TOKEN
@@ -62,13 +69,13 @@ curl.exe --get --data-urlencode "cron=*/30 * * * *" --data-urlencode "format=jso
    npx wrangler secret put PUSHPLUS_CALLBACK_BASE_URL
    ```
 
-   回调密钥至少 32 个字符，可在本机生成：
+   `PUSHPLUS_CALLBACK_BASE_URL` 必须使用上一步取得的 origin，格式严格为 `https://<worker-host>`，不含路径、查询或片段。回调密钥至少 32 个字符，可在本机生成：
 
    ```powershell
    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
    ```
 
-4. 保持夹具来源部署，取得 Worker HTTPS 地址，并将该地址（仅协议和主机）设置为 `PUSHPLUS_CALLBACK_BASE_URL`。随后在 PushPlus 将回调配置为 Worker 的回调地址。
+   程序每次投递都会自动附带包含事件 ID、过期时间与签名的完整回调 URL；无需在 PushPlus 单独配置固定回调地址。
 5. 运行授权工具，在其打开的浏览器中人工完成 GitHub 登录，进入目标工作区的 Go 页面并按提示确认：
 
    ```powershell
@@ -76,7 +83,7 @@ curl.exe --get --data-urlencode "cron=*/30 * * * *" --data-urlencode "format=jso
    ```
 
    工具会验证用量请求后，直接通过标准输入上传 `OPENCODE_SESSION_BUNDLE` 到 Cloudflare Secret；会话不进入文件、命令参数、D1、日志或 Git。
-6. 确认夹具部署和 PushPlus 回调可用后，才将 `USAGE_SOURCE` 改为 `opencode-console`、将 `OPENCODE_CONSOLE_ENABLED` 改为 `true`，并重新部署：
+6. 确认夹具部署和 PushPlus 投递可用后，才将 `USAGE_SOURCE` 改为 `opencode-console`、将 `OPENCODE_CONSOLE_ENABLED` 改为 `true`，并最终部署：
 
    ```powershell
    npm run deploy

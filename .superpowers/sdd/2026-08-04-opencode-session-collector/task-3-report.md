@@ -16,3 +16,33 @@
 ## 外部操作边界
 
 本任务未执行 Cloudflare 登录、D1 创建或迁移、Secret 设置、授权登录、会话上传和部署。README 仅给出这些操作的顺序与命令。
+
+## 修复轮次 1
+
+- 首次部署顺序已改为先以夹具创建 Worker，再设置四个 PushPlus Secret、上传会话，最后启用真实来源。
+- `PUSHPLUS_CALLBACK_BASE_URL` 现明确限定为首次部署取得的 HTTPS origin，且不含路径、查询或片段。
+- 已删除要求在 PushPlus 手工配置固定回调地址的说明；程序会在每次投递时自动附带已签名、含事件 ID 与过期时间的完整回调 URL。
+
+### 本轮验证
+
+本轮未运行完整检查。已执行下列命令并获得预期结果：
+
+```powershell
+git diff --check
+```
+
+结果：通过，无输出。
+
+```powershell
+$credentialPattern = '(' + 'g' + 'hp_|github' + '_pat_|\bsk-[A-Za-z0-9]|Cookie' + ':|Set-Cookie' + ':)'
+& git grep -n -I -E $credentialPattern -- ':!docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md'
+```
+
+结果：无匹配，`git grep` 退出码为 1。
+
+```powershell
+$todoPattern = '(' + 'TO' + 'DO|TB' + 'D)'
+& git grep -n -I -E $todoPattern -- ':!docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md'
+```
+
+结果：无匹配，`git grep` 退出码为 1。
