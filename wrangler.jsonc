@@ -7,7 +7,7 @@
     {
       "binding": "DB",
       "database_name": "opencode-go-usage",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "3759034b-ac92-45ed-a315-f33bd1d7ac92",
       "migrations_dir": "migrations"
     }
   ],
@@ -15,9 +15,9 @@
     "crons": ["*/30 * * * *", "7 1 * * *"]
   },
   "vars": {
-    "USAGE_SOURCE": "fixture",
+    "USAGE_SOURCE": "opencode-console",
     "USAGE_FIXTURE_JSON": "{\"rollingUsage\":{\"status\":\"ok\",\"resetInSec\":3600,\"usagePercent\":49},\"weeklyUsage\":{\"status\":\"ok\",\"resetInSec\":259200,\"usagePercent\":20},\"monthlyUsage\":{\"status\":\"ok\",\"resetInSec\":1209600,\"usagePercent\":10}}",
-    "OPENCODE_CONSOLE_ENABLED": "false",
+    "OPENCODE_CONSOLE_ENABLED": "true",
     "OPENCODE_AUTH_GENERATION": "1"
   },
   "secrets": {

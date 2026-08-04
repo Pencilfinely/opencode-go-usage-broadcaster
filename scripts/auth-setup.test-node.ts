@@ -2,15 +2,74 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import type { Response } from "playwright-core";
 
 import {
   cleanUpBrowserProfile,
-  UsageCandidateCollector,
   uploadSessionBundle,
-  waitForEnter,
   type UploadChild
 } from "./auth-setup";
+
+test("从目标工作区页及其子页识别受限的工作区 ID", async () => {
+  const module = await import("./auth-setup");
+  const workspaceIdFromPageUrl = (module as Record<string, unknown>)
+    .workspaceIdFromPageUrl as ((url: string) => string | undefined) | undefined;
+
+  assert.equal(
+    workspaceIdFromPageUrl?.("https://opencode.ai/workspace/wrk_Alpha42"),
+    "wrk_Alpha42"
+  );
+  assert.equal(
+    workspaceIdFromPageUrl?.("https://opencode.ai/workspace/wrk_Alpha42/settings"),
+    "wrk_Alpha42"
+  );
+  assert.equal(workspaceIdFromPageUrl?.("https://evil.example/workspace/wrk_Alpha42"), undefined);
+  assert.equal(workspaceIdFromPageUrl?.("https://opencode.ai/workspace/not-safe"), undefined);
+});
+
+test("轮询当前及上下文页面直到识别目标工作区", async () => {
+  const module = await import("./auth-setup");
+  const waitForWorkspaceId = (module as Record<string, unknown>)
+    .waitForWorkspaceId as (
+      context: { pages(): Array<{ url(): string }> },
+      signal: AbortSignal,
+      pause: (signal: AbortSignal) => Promise<void>
+    ) => Promise<string>;
+  const urls = ["https://opencode.ai/auth"];
+  let pauses = 0;
+
+  const workspaceId = await waitForWorkspaceId(
+    { pages: () => urls.map((url) => ({ url: () => url })) },
+    new AbortController().signal,
+    async () => {
+      pauses += 1;
+      urls.push("https://opencode.ai/workspace/wrk_Target9/preferences");
+    }
+  );
+
+  assert.equal(workspaceId, "wrk_Target9");
+  assert.equal(pauses, 1);
+});
+
+test("为已识别工作区构造最小化的隐藏 Go 页面 GET 会话", async () => {
+  const module = await import("./auth-setup");
+  const buildSessionBundle = (module as Record<string, unknown>)
+    .buildSessionBundle as (
+      workspaceId: string,
+      authCookie: string
+    ) => { workspaceId: string; auth: { cookie: string }; request: {
+      url: string; method: string; headers: Record<string, string>;
+    } };
+
+  const bundle = buildSessionBundle("wrk_Target9", "cookie-value");
+
+  assert.equal(bundle.workspaceId, "wrk_Target9");
+  assert.equal(bundle.auth.cookie, "auth=cookie-value");
+  assert.deepEqual(bundle.request, {
+    url: "https://opencode.ai/workspace/wrk_Target9/go",
+    method: "GET",
+    headers: { accept: "text/html" }
+  });
+});
 
 test("上传会话包时仅通过子进程标准输入传递敏感内容", async () => {
   const secret = '{"auth":{"cookie":"auth=不应泄露"}}';
@@ -41,23 +100,17 @@ test("上传会话包时仅通过子进程标准输入传递敏感内容", async
     console.log = originalLog;
   }
 
-  assert.match(command, /^npx(?:\.cmd)?$/u);
-  assert.deepEqual(args, ["wrangler", "secret", "put", "OPENCODE_SESSION_BUNDLE"]);
+  assert.equal(command, process.execPath);
+  assert.match(args[0] ?? "", /[\\/]node_modules[\\/]wrangler[\\/]bin[\\/]wrangler\.js$/u);
+  assert.deepEqual(args.slice(1), ["secret", "put", "OPENCODE_SESSION_BUNDLE"]);
   assert.equal(Buffer.concat(received).toString("utf8"), secret);
   assert.equal(args.some((item) => item.includes(secret)), false);
   assert.equal(Object.values(environment ?? {}).some((item) => item?.includes(secret)), false);
   assert.equal(logs.some((item) => item.includes(secret)), false);
 });
 
-test("取消等待输入时关闭提示并继续清理浏览器资料目录", async () => {
-  const controller = new AbortController();
-  const input = new PassThrough();
-  const output = new PassThrough();
+test("浏览器关闭失败时仍清理资料目录", async () => {
   const actions: string[] = [];
-
-  const waiting = waitForEnter("等待登录：", controller.signal, input, output);
-  controller.abort(new Error("用户取消"));
-  await assert.rejects(waiting, /用户取消/u);
 
   await assert.rejects(
     cleanUpBrowserProfile(
@@ -71,24 +124,6 @@ test("取消等待输入时关闭提示并继续清理浏览器资料目录", as
     /关闭失败/u
   );
   assert.deepEqual(actions, ["关闭浏览器", "删除目录"]);
-});
-
-test("候选请求绑定响应页面的 Go 工作区且不会覆盖先完成的候选", async () => {
-  let resolveFirst: ((payload: unknown) => void) | undefined;
-  const firstPayload = new Promise<unknown>((resolvePayload) => {
-    resolveFirst = resolvePayload;
-  });
-  const collector = new UsageCandidateCollector();
-  collector.observe(responseFor("https://opencode.ai/workspace/第一工作区/go", firstPayload));
-  collector.observe(responseFor("https://opencode.ai/workspace/第二工作区/go", usagePayload()));
-
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(collector.candidate?.workspaceId, "第二工作区");
-
-  resolveFirst?.(usagePayload());
-  await collector.waitForPending();
-  assert.equal(collector.candidate?.workspaceId, "第二工作区");
 });
 
 test("上传输入失败时终止仍在运行的上传子进程", async () => {
@@ -162,24 +197,3 @@ test("上传期间取消时终止子进程并等待关闭后拒绝", async () =>
   assert.equal(outcomeBeforeClose, "pending");
   assert.equal(outcome, "rejected");
 });
-
-function usagePayload(): unknown {
-  return {
-    rollingUsage: { usagePercent: 1, resetInSec: 60 },
-    weeklyUsage: { usagePercent: 2, resetInSec: 120 },
-    monthlyUsage: { usagePercent: 3, resetInSec: 180 }
-  };
-}
-
-function responseFor(pageUrl: string, payload: unknown): Response {
-  return {
-    url: () => "https://opencode.ai/_server",
-    json: async () => payload,
-    request: () => ({
-      method: () => "GET",
-      headers: () => ({ accept: "application/json", authorization: "不会保留" }),
-      postData: () => null,
-      frame: () => ({ page: () => ({ url: () => pageUrl }) })
-    })
-  } as unknown as Response;
-}

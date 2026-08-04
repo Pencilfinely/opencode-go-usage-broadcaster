@@ -11,6 +11,7 @@ import {
 import {
   normalizeOpenCodeUsage,
   OPENCODE_RESPONSE_LIMIT_BYTES,
+  parseOpenCodeUsageResponse,
   parseSessionBundle,
   validateOpenCodeRequest,
   type OpenCodeSessionBundleV1
@@ -151,13 +152,14 @@ export class OpenCodeConsoleQuotaSource implements QuotaSource {
     const bundle = typeof this.rawBundle === "string"
       ? parseSessionBundle(this.rawBundle)
       : this.rawBundle;
-    const request = validateOpenCodeRequest(bundle.request);
+    const request = validateOpenCodeRequest(bundle.request, bundle.workspaceId);
+    const fetchImpl = this.fetchImpl;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
     try {
       let response: Response;
       try {
-        response = await this.fetchImpl(request.url, {
+        response = await fetchImpl(request.url, {
           method: request.method,
           headers: { ...request.headers, cookie: bundle.auth.cookie },
           ...(request.body === undefined ? {} : { body: request.body }),
@@ -189,12 +191,7 @@ export class OpenCodeConsoleQuotaSource implements QuotaSource {
         if (error instanceof SourceError) throw error;
         throw new SourceError("transient", "OpenCode 响应读取失败");
       }
-      let payload: unknown;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        throw new SourceError("schema", "OpenCode 响应不是有效 JSON");
-      }
+      const payload = parseOpenCodeUsageResponse(text);
       return {
         source: "opencode-console",
         observedAt: now.toISOString(),
