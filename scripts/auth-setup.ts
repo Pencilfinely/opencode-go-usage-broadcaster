@@ -19,8 +19,14 @@ const AUTH_URL = "https://opencode.ai/auth";
 const OPENCODE_ORIGIN = "https://opencode.ai";
 const TARGET_PATH = "/_server";
 const UPLOAD_SECRET_NAME = "OPENCODE_SESSION_BUNDLE";
+const UPLOAD_TIMEOUT_MS = 30_000;
 
-export type UploadChild = Pick<ChildProcessWithoutNullStreams, "stdin" | "once">;
+export type UploadChild = Pick<ChildProcessWithoutNullStreams, "stdin" | "once" | "kill">;
+
+export type UsageCandidate = {
+  workspaceId: string;
+  request: OpenCodeSessionBundleV1["request"];
+};
 
 export type UploadSpawnOptions = {
   stdio: ["pipe", "ignore", "inherit"];
@@ -78,13 +84,34 @@ function workspaceIdFromUrl(url: string): string | undefined {
   }
 }
 
-function waitForEnter(message: string): Promise<void> {
-  const readline = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolvePrompt) => {
-    readline.question(message, () => {
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("授权已取消");
+}
+
+export function waitForEnter(
+  message: string,
+  signal: AbortSignal,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stdout
+): Promise<void> {
+  const readline = createInterface({ input, output });
+  return new Promise((resolvePrompt, rejectPrompt) => {
+    let finished = false;
+    const finish = (error?: Error) => {
+      if (finished) return;
+      finished = true;
+      signal.removeEventListener("abort", onAbort);
       readline.close();
-      resolvePrompt();
-    });
+      if (error) rejectPrompt(error);
+      else resolvePrompt();
+    };
+    const onAbort = () => finish(abortError(signal));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    readline.question(message, () => finish());
   });
 }
 
@@ -103,44 +130,72 @@ async function launchVisibleContext(profileDirectory: string): Promise<BrowserCo
   throw lastError;
 }
 
-function currentWorkspaceId(context: BrowserContext): string | undefined {
-  for (const page of context.pages()) {
-    const workspaceId = workspaceIdFromUrl(page.url());
-    if (workspaceId) return workspaceId;
+export class UsageCandidateCollector {
+  candidate: UsageCandidate | undefined;
+  private readonly pending = new Set<Promise<void>>();
+
+  observe(response: Response): void {
+    if (this.candidate || !isTargetResponse(response)) return;
+    const parsing = this.parse(response).then((candidate) => {
+      if (candidate && !this.candidate) this.candidate = candidate;
+    }).catch(() => undefined);
+    this.pending.add(parsing);
+    void parsing.finally(() => this.pending.delete(parsing));
   }
-  return undefined;
+
+  async waitForPending(): Promise<void> {
+    await Promise.all([...this.pending]);
+  }
+
+  private async parse(response: Response): Promise<UsageCandidate | undefined> {
+    try {
+      const workspaceId = workspaceIdFromUrl(response.request().frame().page().url());
+      if (!workspaceId) return undefined;
+      const payload: unknown = await response.json();
+      normalizeOpenCodeUsage(payload, new Date());
+      const request = describeRequest(response);
+      return request ? { workspaceId, request } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
 }
 
-async function collectSessionBundle(): Promise<OpenCodeSessionBundleV1> {
+type BrowserProfile = Pick<BrowserContext, "close">;
+type ProfileRemover = (directory: string) => Promise<void>;
+
+export async function cleanUpBrowserProfile(
+  context: BrowserProfile | undefined,
+  profileDirectory: string,
+  removeProfile: ProfileRemover = (directory) => rm(directory, { recursive: true, force: true })
+): Promise<void> {
+  try {
+    await context?.close();
+  } finally {
+    await removeProfile(profileDirectory);
+  }
+}
+
+async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessionBundleV1> {
   const profileDirectory = await mkdtemp(join(tmpdir(), "opencode-auth-"));
   let context: BrowserContext | undefined;
-  let capturedRequest: OpenCodeSessionBundleV1["request"] | undefined;
   try {
+    signal.throwIfAborted();
     context = await launchVisibleContext(profileDirectory);
-    context.on("response", (response) => {
-      if (capturedRequest || !isTargetResponse(response)) return;
-      void response.json().then((payload: unknown) => {
-        try {
-          normalizeOpenCodeUsage(payload, new Date());
-          capturedRequest = describeRequest(response);
-        } catch {
-          // 非用量响应不会参与会话包构造。
-        }
-      }).catch(() => undefined);
-    });
+    signal.throwIfAborted();
+    const candidates = new UsageCandidateCollector();
+    context.on("response", (response) => candidates.observe(response));
 
     const page = await context.newPage();
     await page.goto(AUTH_URL);
     console.log("请在打开的浏览器中完成 GitHub 登录，并进入工作区的 Go 页面。");
 
     while (true) {
-      await waitForEnter("完成后按回车继续检查：");
-      const workspaceId = currentWorkspaceId(context);
-      if (!workspaceId) {
-        console.log("尚未检测到 Go 页面，请返回 https://opencode.ai/workspace/{id}/go 后重试。");
-        continue;
-      }
-      if (!capturedRequest) {
+      await waitForEnter("完成后按回车继续检查：", signal);
+      await candidates.waitForPending();
+      signal.throwIfAborted();
+      const candidate = candidates.candidate;
+      if (!candidate) {
         console.log("尚未捕获用量请求，请在 Go 页面刷新后按回车重试。");
         continue;
       }
@@ -149,21 +204,18 @@ async function collectSessionBundle(): Promise<OpenCodeSessionBundleV1> {
         console.log("未检测到 OpenCode auth Cookie，请完成登录后重试。");
         continue;
       }
+      signal.throwIfAborted();
       return parseSessionBundle(JSON.stringify({
         version: 1,
         generation: randomUUID(),
         createdAt: new Date().toISOString(),
-        workspaceId,
+        workspaceId: candidate.workspaceId,
         auth: { cookie: `auth=${authCookie.value}` },
-        request: capturedRequest
+        request: candidate.request
       } satisfies OpenCodeSessionBundleV1));
     }
   } finally {
-    try {
-      await context?.close();
-    } finally {
-      await rm(profileDirectory, { recursive: true, force: true });
-    }
+    await cleanUpBrowserProfile(context, profileDirectory);
   }
 }
 
@@ -185,25 +237,54 @@ export async function uploadSessionBundle(
       rejectUpload(new Error("无法启动 Secret 上传命令"));
       return;
     }
-    child.once("error", () => rejectUpload(new Error("Secret 上传命令执行失败")));
+    let settled = false;
+    const timer = setTimeout(() => settle(new Error("Secret 上传超时")), UPLOAD_TIMEOUT_MS);
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        try {
+          child.kill();
+        } finally {
+          rejectUpload(error);
+        }
+      } else {
+        resolveUpload();
+      }
+    };
+    child.once("error", () => settle(new Error("Secret 上传命令执行失败")));
     child.once("close", (code) => {
-      if (code === 0) resolveUpload();
-      else rejectUpload(new Error("Secret 上传失败"));
+      if (code === 0) settle();
+      else settle(new Error("Secret 上传失败"));
     });
-    child.stdin.once("error", () => rejectUpload(new Error("Secret 上传输入失败")));
-    child.stdin.end(sessionBundle, "utf8");
+    child.stdin.once("error", () => settle(new Error("Secret 上传输入失败")));
+    try {
+      child.stdin.end(sessionBundle, "utf8");
+    } catch {
+      settle(new Error("Secret 上传输入失败"));
+    }
   });
 }
 
 async function main(): Promise<void> {
-  const bundle = await collectSessionBundle();
-  const snapshot = await new OpenCodeConsoleQuotaSource(bundle).fetch(new Date());
-  console.log([
-    snapshot.windows.rolling.usedPercent,
-    snapshot.windows.weekly.usedPercent,
-    snapshot.windows.monthly.usedPercent
-  ].map((percent) => `${percent}%`).join("\n"));
-  await uploadSessionBundle(JSON.stringify(bundle));
+  const controller = new AbortController();
+  const onSigint = () => controller.abort(new Error("授权已取消"));
+  process.on("SIGINT", onSigint);
+  try {
+    const bundle = await collectSessionBundle(controller.signal);
+    controller.signal.throwIfAborted();
+    const snapshot = await new OpenCodeConsoleQuotaSource(bundle).fetch(new Date());
+    controller.signal.throwIfAborted();
+    console.log([
+      snapshot.windows.rolling.usedPercent,
+      snapshot.windows.weekly.usedPercent,
+      snapshot.windows.monthly.usedPercent
+    ].map((percent) => `${percent}%`).join("\n"));
+    await uploadSessionBundle(JSON.stringify(bundle));
+  } finally {
+    process.off("SIGINT", onSigint);
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

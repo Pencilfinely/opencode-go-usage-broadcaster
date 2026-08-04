@@ -16,3 +16,17 @@
 ## 已知顾虑
 
 - 该工具需要本机已安装 Chrome 或 Edge，并由操作者完成真实 GitHub 登录；按约束未自动化浏览器或外部服务。
+
+## 修复轮次 1
+
+### RED
+
+- 命令：`npx tsx --test scripts/auth-setup.test-node.ts`
+- 结果：退出码 `1`；测试加载失败，提示 `./auth-setup` 未导出 `UsageCandidateCollector`。该失败证明取消清理、工作区绑定和失败终止所需的最小接口尚未实现。
+
+### GREEN
+
+- 命令：`npx tsx --test scripts/auth-setup.test-node.ts`
+- 结果：退出码 `0`；4/4 通过，覆盖会话仅走标准输入、取消等待后的目录清理、响应页面工作区绑定及 stdin 失败时终止子进程。
+- 命令：`npm run typecheck`
+- 结果：退出码 `0`；`wrangler types && tsc --noEmit` 通过。
