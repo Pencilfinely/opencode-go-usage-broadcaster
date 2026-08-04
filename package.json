@@ -10,6 +10,7 @@
     "dev": "wrangler dev",
     "typegen": "wrangler types",
     "typecheck": "wrangler types && tsc --noEmit",
+    "auth:setup": "tsx scripts/auth-setup.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm test",
@@ -18,6 +19,8 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.20.1",
     "@types/node": "24.13.3",
+    "playwright-core": "1.62.1",
+    "tsx": "4.23.5",
     "typescript": "7.0.2",
     "vitest": "4.1.10",
     "wrangler": "4.118.0"

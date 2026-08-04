@@ -8,6 +8,13 @@ import {
   type UsageWindow,
   type WindowKey
 } from "./domain";
+import {
+  normalizeOpenCodeUsage,
+  OPENCODE_RESPONSE_LIMIT_BYTES,
+  parseSessionBundle,
+  validateOpenCodeRequest,
+  type OpenCodeSessionBundleV1
+} from "./opencode-session";
 
 type FixtureWindow = {
   status: "ok" | "rate-limited";
@@ -90,9 +97,127 @@ export class DisabledConsoleQuotaSource implements QuotaSource {
   }
 }
 
-export function createQuotaSource(config: AppConfig): QuotaSource {
+async function readLimitedText(response: Response): Promise<string> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > OPENCODE_RESPONSE_LIMIT_BYTES) {
+    throw new SourceError("schema", "响应体超过限制");
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteLength += value.byteLength;
+      if (byteLength > OPENCODE_RESPONSE_LIMIT_BYTES) {
+        throw new SourceError("schema", "响应体超过限制");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function isLoginRedirect(response: Response, requestUrl: string): boolean {
+  if (response.status < 300 || response.status >= 400) return false;
+  const location = response.headers.get("location");
+  if (location === null) return false;
+  try {
+    const redirect = new URL(location, requestUrl);
+    return redirect.origin === "https://opencode.ai" &&
+      /^\/auth\/?$/u.test(redirect.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export class OpenCodeConsoleQuotaSource implements QuotaSource {
+  constructor(
+    private readonly rawBundle: string | OpenCodeSessionBundleV1,
+    private readonly fetchImpl: typeof fetch = fetch
+  ) {}
+
+  async fetch(now: Date): Promise<QuotaSnapshot> {
+    const bundle = typeof this.rawBundle === "string"
+      ? parseSessionBundle(this.rawBundle)
+      : this.rawBundle;
+    const request = validateOpenCodeRequest(bundle.request);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(request.url, {
+          method: request.method,
+          headers: { ...request.headers, cookie: bundle.auth.cookie },
+          ...(request.body === undefined ? {} : { body: request.body }),
+          redirect: "manual",
+          signal: controller.signal
+        });
+      } catch {
+        throw new SourceError("transient", "OpenCode 请求失败或超时");
+      }
+
+      if (
+        response.status === 401 ||
+        response.status === 403 ||
+        isLoginRedirect(response, request.url)
+      ) {
+        throw new SourceError("auth", "OpenCode 会话已失效");
+      }
+      if (response.status === 429 || response.status === 408 || response.status >= 500) {
+        throw new SourceError("transient", "OpenCode 服务暂时不可用");
+      }
+      if (!response.ok) {
+        throw new SourceError("schema", "OpenCode 响应状态无效");
+      }
+
+      let text: string;
+      try {
+        text = await readLimitedText(response);
+      } catch (error) {
+        if (error instanceof SourceError) throw error;
+        throw new SourceError("transient", "OpenCode 响应读取失败");
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        throw new SourceError("schema", "OpenCode 响应不是有效 JSON");
+      }
+      return {
+        source: "opencode-console",
+        observedAt: now.toISOString(),
+        windows: normalizeOpenCodeUsage(payload, now)
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+export function createQuotaSource(
+  config: AppConfig,
+  sourceFetchImpl: typeof fetch = fetch
+): QuotaSource {
   if (config.sourceName === "fixture") {
     return new FixtureQuotaSource(config.fixtureJson);
+  }
+  if (config.consoleEnabled) {
+    return new OpenCodeConsoleQuotaSource(
+      config.sessionBundle ?? "",
+      sourceFetchImpl
+    );
   }
   return new DisabledConsoleQuotaSource();
 }

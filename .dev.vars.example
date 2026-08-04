@@ -2,3 +2,4 @@ PUSHPLUS_TOKEN=test-token-do-not-use
 PUSHPLUS_TOPIC=test-topic-do-not-use
 PUSHPLUS_CALLBACK_SECRET=test-callback-secret-32-bytes-minimum
 PUSHPLUS_CALLBACK_BASE_URL=http://localhost:8787
+# OPENCODE_SESSION_BUNDLE 仅在生产环境由 npm run auth:setup 通过标准输入上传；不要写入本文件或 .dev.vars。

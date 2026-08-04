@@ -10,11 +10,20 @@ const fixture = JSON.stringify({
 });
 
 type ConfigBindingOverrides = Partial<
-  Omit<Cloudflare.Env, "USAGE_SOURCE" | "USAGE_FIXTURE_JSON" | "OPENCODE_CONSOLE_ENABLED">
+  Omit<
+    Cloudflare.Env,
+    | "USAGE_SOURCE"
+    | "USAGE_FIXTURE_JSON"
+    | "OPENCODE_CONSOLE_ENABLED"
+    | "OPENCODE_AUTH_GENERATION"
+    | "OPENCODE_SESSION_BUNDLE"
+  >
 > & {
   USAGE_SOURCE?: string;
   USAGE_FIXTURE_JSON?: string;
   OPENCODE_CONSOLE_ENABLED?: string;
+  OPENCODE_AUTH_GENERATION?: string | undefined;
+  OPENCODE_SESSION_BUNDLE?: string | undefined;
 };
 
 function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
@@ -55,12 +64,12 @@ describe("quota source boundary", () => {
     });
   });
 
-  it("never performs a console request in the MVP", async () => {
+  it("在显式开关关闭时不执行控制台请求", async () => {
     const source = createQuotaSource(
       loadConfig(
         makeEnv({
           USAGE_SOURCE: "opencode-console",
-          OPENCODE_CONSOLE_ENABLED: "true"
+          OPENCODE_CONSOLE_ENABLED: "false"
         })
       )
     );
@@ -68,7 +77,7 @@ describe("quota source boundary", () => {
     let fetchCalls = 0;
     globalThis.fetch = (async () => {
       fetchCalls += 1;
-      throw new Error("Disabled console source must not call fetch");
+      throw new Error("禁用的控制台来源不得调用 fetch");
     }) as typeof fetch;
 
     try {
@@ -80,5 +89,59 @@ describe("quota source boundary", () => {
     }
 
     expect(fetchCalls).toBe(0);
+  });
+
+  it("启用控制台来源时使用会话包代次", async () => {
+    const sessionBundle = JSON.stringify({
+      version: 1,
+      generation: "bundle-generation",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      workspaceId: "workspace-1",
+      auth: { cookie: "auth=session-value" },
+      request: {
+        url: "https://opencode.ai/_server/usage",
+        method: "GET",
+        headers: { accept: "application/json" }
+      }
+    });
+    const config = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: sessionBundle
+    }));
+    const source = createQuotaSource(config, async () => Response.json({
+      rollingUsage: { usagePercent: 49, resetInSec: 3600 },
+      weeklyUsage: { usagePercent: 20, resetInSec: 7200 },
+      monthlyUsage: { usagePercent: 10, resetInSec: 10800 }
+    }));
+
+    const snapshot = await source.fetch(new Date("2026-08-04T01:00:00Z"));
+
+    expect(config.authGeneration).toBe("bundle-generation");
+    expect(snapshot.source).toBe("opencode-console");
+  });
+
+  it("将损坏或缺失的会话包延迟到来源抓取时归类为结构错误", async () => {
+    const damaged = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: "{损坏的秘密",
+      OPENCODE_AUTH_GENERATION: undefined
+    }));
+    const missing = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: undefined,
+      OPENCODE_AUTH_GENERATION: undefined
+    }));
+
+    expect(damaged.authGeneration).toBe(missing.authGeneration);
+    expect(damaged.authGeneration).not.toContain("损坏的秘密");
+    await expect(createQuotaSource(damaged).fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
+    await expect(createQuotaSource(missing).fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
   });
 });

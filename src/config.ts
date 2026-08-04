@@ -1,8 +1,11 @@
+import { parseSessionBundle } from "./opencode-session";
+
 export interface AppConfig {
   sourceName: "fixture" | "opencode-console";
   fixtureJson: string;
   consoleEnabled: boolean;
   authGeneration: string;
+  sessionBundle?: string;
   pushplus: {
     token: string;
     topic: string;
@@ -14,6 +17,17 @@ export interface AppConfig {
 function required(value: string | undefined, name: string): string {
   if (!value) throw new Error("Missing required binding: " + name);
   return value;
+}
+
+const UNAVAILABLE_AUTH_GENERATION = "unavailable-session-bundle";
+
+function sessionAuthGeneration(raw: string | undefined): string {
+  if (raw === undefined) return UNAVAILABLE_AUTH_GENERATION;
+  try {
+    return parseSessionBundle(raw).generation;
+  } catch {
+    return UNAVAILABLE_AUTH_GENERATION;
+  }
 }
 
 export function loadConfig(env: Cloudflare.Env): AppConfig {
@@ -58,14 +72,19 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     throw new Error("PUSHPLUS_CALLBACK_SECRET must be at least 32 characters");
   }
 
+  const consoleEnabled = bindings.OPENCODE_CONSOLE_ENABLED === "true";
+  const sessionBundle = sourceName === "opencode-console" && consoleEnabled
+    ? bindings.OPENCODE_SESSION_BUNDLE
+    : undefined;
+
   return {
     sourceName,
     fixtureJson: bindings.USAGE_FIXTURE_JSON ?? "",
-    consoleEnabled: bindings.OPENCODE_CONSOLE_ENABLED === "true",
-    authGeneration: required(
-      bindings.OPENCODE_AUTH_GENERATION,
-      "OPENCODE_AUTH_GENERATION"
-    ),
+    consoleEnabled,
+    authGeneration: sourceName === "opencode-console" && consoleEnabled
+      ? sessionAuthGeneration(sessionBundle)
+      : required(bindings.OPENCODE_AUTH_GENERATION, "OPENCODE_AUTH_GENERATION"),
+    ...(sessionBundle === undefined ? {} : { sessionBundle }),
     pushplus: {
       token: required(bindings.PUSHPLUS_TOKEN, "PUSHPLUS_TOKEN"),
       topic: required(bindings.PUSHPLUS_TOPIC, "PUSHPLUS_TOPIC"),
