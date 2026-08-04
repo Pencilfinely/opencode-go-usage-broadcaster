@@ -1,0 +1,4 @@
+PUSHPLUS_TOKEN=test-token-do-not-use
+PUSHPLUS_TOPIC=test-topic-do-not-use
+PUSHPLUS_CALLBACK_SECRET=test-callback-secret-32-bytes-minimum
+PUSHPLUS_CALLBACK_BASE_URL=http://localhost:8787

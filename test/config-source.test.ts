@@ -1,0 +1,84 @@
+import { describe, expect, it } from "vitest";
+import { loadConfig } from "../src/config";
+import { CollectorDisabledError } from "../src/domain";
+import { createQuotaSource } from "../src/source";
+
+const fixture = JSON.stringify({
+  rollingUsage: { status: "ok", resetInSec: 3600, usagePercent: 49 },
+  weeklyUsage: { status: "ok", resetInSec: 7200, usagePercent: 20 },
+  monthlyUsage: { status: "ok", resetInSec: 10800, usagePercent: 10 }
+});
+
+type ConfigBindingOverrides = Partial<
+  Omit<Cloudflare.Env, "USAGE_SOURCE" | "USAGE_FIXTURE_JSON" | "OPENCODE_CONSOLE_ENABLED">
+> & {
+  USAGE_SOURCE?: string;
+  USAGE_FIXTURE_JSON?: string;
+  OPENCODE_CONSOLE_ENABLED?: string;
+};
+
+function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
+  return {
+    USAGE_SOURCE: "fixture",
+    USAGE_FIXTURE_JSON: fixture,
+    OPENCODE_CONSOLE_ENABLED: "false",
+    OPENCODE_AUTH_GENERATION: "1",
+    PUSHPLUS_TOKEN: "test-token",
+    PUSHPLUS_TOPIC: "test-topic",
+    PUSHPLUS_CALLBACK_SECRET: "test-callback-secret-32-bytes-minimum",
+    PUSHPLUS_CALLBACK_BASE_URL: "https://worker.test",
+    ...overrides
+  } as Cloudflare.Env;
+}
+
+describe("quota source boundary", () => {
+  it("parses all three fixture windows", async () => {
+    const source = createQuotaSource(loadConfig(makeEnv()));
+    const snapshot = await source.fetch(new Date("2026-08-03T01:00:00Z"));
+
+    expect(snapshot.source).toBe("fixture");
+    expect(snapshot.windows.rolling.usedPercent).toBe(49);
+    expect(snapshot.windows.monthly.resetAt).toBe("2026-08-03T04:00:00.000Z");
+  });
+
+  it("rejects an incomplete fixture", async () => {
+    const incomplete = JSON.stringify({
+      rollingUsage: { status: "ok", resetInSec: 3600, usagePercent: 49 },
+      weeklyUsage: { status: "ok", resetInSec: 7200, usagePercent: 20 }
+    });
+    const source = createQuotaSource(
+      loadConfig(makeEnv({ USAGE_FIXTURE_JSON: incomplete }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
+  });
+
+  it("never performs a console request in the MVP", async () => {
+    const source = createQuotaSource(
+      loadConfig(
+        makeEnv({
+          USAGE_SOURCE: "opencode-console",
+          OPENCODE_CONSOLE_ENABLED: "true"
+        })
+      )
+    );
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error("Disabled console source must not call fetch");
+    }) as typeof fetch;
+
+    try {
+      await expect(source.fetch(new Date())).rejects.toBeInstanceOf(
+        CollectorDisabledError
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(fetchCalls).toBe(0);
+  });
+});
