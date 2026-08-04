@@ -11,6 +11,7 @@ import {
 import {
   normalizeOpenCodeUsage,
   OPENCODE_RESPONSE_LIMIT_BYTES,
+  parseSessionBundle,
   validateOpenCodeRequest,
   type OpenCodeSessionBundleV1
 } from "./opencode-session";
@@ -127,20 +128,30 @@ async function readLimitedText(response: Response): Promise<string> {
   return new TextDecoder().decode(bytes);
 }
 
-function isLoginRedirect(response: Response): boolean {
+function isLoginRedirect(response: Response, requestUrl: string): boolean {
   if (response.status < 300 || response.status >= 400) return false;
   const location = response.headers.get("location");
-  return location !== null && /(?:^|[/?#])login(?:[/?#]|$)/iu.test(location);
+  if (location === null) return false;
+  try {
+    const redirect = new URL(location, requestUrl);
+    return redirect.origin === "https://opencode.ai" &&
+      /^\/auth\/?$/u.test(redirect.pathname);
+  } catch {
+    return false;
+  }
 }
 
 export class OpenCodeConsoleQuotaSource implements QuotaSource {
   constructor(
-    private readonly bundle: OpenCodeSessionBundleV1,
+    private readonly rawBundle: string | OpenCodeSessionBundleV1,
     private readonly fetchImpl: typeof fetch = fetch
   ) {}
 
   async fetch(now: Date): Promise<QuotaSnapshot> {
-    const request = validateOpenCodeRequest(this.bundle.request);
+    const bundle = typeof this.rawBundle === "string"
+      ? parseSessionBundle(this.rawBundle)
+      : this.rawBundle;
+    const request = validateOpenCodeRequest(bundle.request);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
     try {
@@ -148,7 +159,7 @@ export class OpenCodeConsoleQuotaSource implements QuotaSource {
       try {
         response = await this.fetchImpl(request.url, {
           method: request.method,
-          headers: { ...request.headers, cookie: this.bundle.auth.cookie },
+          headers: { ...request.headers, cookie: bundle.auth.cookie },
           ...(request.body === undefined ? {} : { body: request.body }),
           redirect: "manual",
           signal: controller.signal
@@ -157,7 +168,11 @@ export class OpenCodeConsoleQuotaSource implements QuotaSource {
         throw new SourceError("transient", "OpenCode 请求失败或超时");
       }
 
-      if (response.status === 401 || response.status === 403 || isLoginRedirect(response)) {
+      if (
+        response.status === 401 ||
+        response.status === 403 ||
+        isLoginRedirect(response, request.url)
+      ) {
         throw new SourceError("auth", "OpenCode 会话已失效");
       }
       if (response.status === 429 || response.status === 408 || response.status >= 500) {
@@ -198,8 +213,11 @@ export function createQuotaSource(
   if (config.sourceName === "fixture") {
     return new FixtureQuotaSource(config.fixtureJson);
   }
-  if (config.consoleEnabled && config.sessionBundle) {
-    return new OpenCodeConsoleQuotaSource(config.sessionBundle, sourceFetchImpl);
+  if (config.consoleEnabled) {
+    return new OpenCodeConsoleQuotaSource(
+      config.sessionBundle ?? "",
+      sourceFetchImpl
+    );
   }
   return new DisabledConsoleQuotaSource();
 }

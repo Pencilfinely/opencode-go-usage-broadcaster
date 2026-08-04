@@ -10,12 +10,20 @@ const fixture = JSON.stringify({
 });
 
 type ConfigBindingOverrides = Partial<
-  Omit<Cloudflare.Env, "USAGE_SOURCE" | "USAGE_FIXTURE_JSON" | "OPENCODE_CONSOLE_ENABLED">
+  Omit<
+    Cloudflare.Env,
+    | "USAGE_SOURCE"
+    | "USAGE_FIXTURE_JSON"
+    | "OPENCODE_CONSOLE_ENABLED"
+    | "OPENCODE_AUTH_GENERATION"
+    | "OPENCODE_SESSION_BUNDLE"
+  >
 > & {
   USAGE_SOURCE?: string;
   USAGE_FIXTURE_JSON?: string;
   OPENCODE_CONSOLE_ENABLED?: string;
-  OPENCODE_SESSION_BUNDLE?: string;
+  OPENCODE_AUTH_GENERATION?: string | undefined;
+  OPENCODE_SESSION_BUNDLE?: string | undefined;
 };
 
 function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
@@ -111,5 +119,29 @@ describe("quota source boundary", () => {
 
     expect(config.authGeneration).toBe("bundle-generation");
     expect(snapshot.source).toBe("opencode-console");
+  });
+
+  it("将损坏或缺失的会话包延迟到来源抓取时归类为结构错误", async () => {
+    const damaged = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: "{损坏的秘密",
+      OPENCODE_AUTH_GENERATION: undefined
+    }));
+    const missing = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: undefined,
+      OPENCODE_AUTH_GENERATION: undefined
+    }));
+
+    expect(damaged.authGeneration).toBe(missing.authGeneration);
+    expect(damaged.authGeneration).not.toContain("损坏的秘密");
+    await expect(createQuotaSource(damaged).fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
+    await expect(createQuotaSource(missing).fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
   });
 });

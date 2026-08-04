@@ -239,4 +239,65 @@ describe("scheduled orchestration", () => {
       error_kind: "schema"
     });
   });
+
+  it("损坏的会话 Secret 连续失败时保留已有 quota 且只创建一次结构故障", async () => {
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(AT_0900),
+        cron: "*/30 * * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(42, AT_0900)) },
+        now: () => AT_0900,
+        fetchImpl: pushFetch
+      }
+    );
+    const quotaBefore = await env.DB.prepare(
+      "SELECT value_json FROM runtime_state WHERE key = 'quota'"
+    ).first<{ value_json: string }>();
+    const damagedSecret = '{"auth":{"cookie":"auth=不得写入状态"}}';
+    const sourceFetch = vi.fn();
+    const damagedEnv = {
+      ...testEnv(),
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: damagedSecret,
+      OPENCODE_AUTH_GENERATION: undefined
+    } as unknown as Cloudflare.Env;
+
+    for (const scheduledTime of [AT_0900 + 30 * 60 * 1000, AT_0900 + 60 * 60 * 1000]) {
+      await runScheduled(
+        createScheduledController({
+          scheduledTime: new Date(scheduledTime),
+          cron: "*/30 * * * *"
+        }),
+        damagedEnv,
+        createExecutionContext(),
+        {
+          now: () => scheduledTime,
+          fetchImpl: pushFetch,
+          sourceFetchImpl: sourceFetch
+        }
+      );
+    }
+
+    const quotaAfter = await env.DB.prepare(
+      "SELECT value_json FROM runtime_state WHERE key = 'quota'"
+    ).first<{ value_json: string }>();
+    const faults = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events WHERE kind = 'fault'"
+    ).first<{ count: number }>();
+    const runtime = await env.DB.prepare(
+      "SELECT value_json FROM runtime_state WHERE key = 'runtime'"
+    ).first<{ value_json: string }>();
+    expect(quotaAfter).toEqual(quotaBefore);
+    expect(faults?.count).toBe(1);
+    expect(runtime?.value_json).not.toContain("不得写入状态");
+    expect(sourceFetch).not.toHaveBeenCalled();
+  });
 });

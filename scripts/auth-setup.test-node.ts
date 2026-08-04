@@ -28,7 +28,7 @@ test("上传会话包时仅通过子进程标准输入传递敏感内容", async
   const originalLog = console.log;
   console.log = (...values: unknown[]) => logs.push(values.join(" "));
   try {
-    await uploadSessionBundle(secret, {
+    await uploadSessionBundle(secret, new AbortController().signal, {
       spawn(commandName, commandArgs, options) {
         command = commandName;
         args = commandArgs;
@@ -101,7 +101,7 @@ test("上传输入失败时终止仍在运行的上传子进程", async () => {
     return true;
   };
 
-  const uploading = uploadSessionBundle("秘密会话", {
+  const uploading = uploadSessionBundle("秘密会话", new AbortController().signal, {
     spawn() {
       queueMicrotask(() => child.stdin.emit("error", new Error("输入失败")));
       return child;
@@ -110,6 +110,57 @@ test("上传输入失败时终止仍在运行的上传子进程", async () => {
 
   await assert.rejects(uploading, /上传输入失败/u);
   assert.equal(killed, 1);
+});
+
+test("上传开始前已取消时不启动子进程", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("用户取消上传"));
+  let spawnCalls = 0;
+
+  await assert.rejects(
+    uploadSessionBundle("秘密会话", controller.signal, {
+      spawn() {
+        spawnCalls += 1;
+        throw new Error("不得启动");
+      }
+    }),
+    /用户取消上传/u
+  );
+  assert.equal(spawnCalls, 0);
+});
+
+test("上传期间取消时终止子进程并等待关闭后拒绝", async () => {
+  const controller = new AbortController();
+  const emitter = new EventEmitter();
+  const child = emitter as unknown as UploadChild & { stdin: PassThrough };
+  child.stdin = new PassThrough();
+  let killed = 0;
+  child.kill = () => {
+    killed += 1;
+    return true;
+  };
+
+  let outcome: "pending" | "resolved" | "rejected" = "pending";
+  const uploading = uploadSessionBundle("秘密会话", controller.signal, {
+    spawn() {
+      return child;
+    }
+  });
+  void uploading.then(
+    () => { outcome = "resolved"; },
+    () => { outcome = "rejected"; }
+  );
+
+  controller.abort(new Error("用户取消上传"));
+  await Promise.resolve();
+  const outcomeBeforeClose = outcome;
+  const killedBeforeClose = killed;
+  emitter.emit("close", 0);
+
+  await assert.rejects(uploading, /用户取消上传/u);
+  assert.equal(killedBeforeClose, 1);
+  assert.equal(outcomeBeforeClose, "pending");
+  assert.equal(outcome, "rejected");
 });
 
 function usagePayload(): unknown {

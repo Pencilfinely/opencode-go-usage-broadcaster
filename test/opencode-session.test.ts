@@ -67,6 +67,34 @@ describe("OpenCode 控制台采集器", () => {
     });
   });
 
+  it("将同源 auth 登录重定向归类为认证错误", async () => {
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(null, {
+        status: 302,
+        headers: { location: "/auth" }
+      }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "auth"
+    });
+  });
+
+  it("将跨源 login 重定向归类为结构错误", async () => {
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(null, {
+        status: 302,
+        headers: { location: "https://example.test/login" }
+      }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
+  });
+
   it("将缺少用量窗口的响应归类为结构错误", async () => {
     const source = new OpenCodeConsoleQuotaSource(
       bundle(),

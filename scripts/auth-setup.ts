@@ -21,7 +21,10 @@ const TARGET_PATH = "/_server";
 const UPLOAD_SECRET_NAME = "OPENCODE_SESSION_BUNDLE";
 const UPLOAD_TIMEOUT_MS = 30_000;
 
-export type UploadChild = Pick<ChildProcessWithoutNullStreams, "stdin" | "once" | "kill">;
+export type UploadChild = Pick<
+  ChildProcessWithoutNullStreams,
+  "stdin" | "once" | "off" | "kill"
+>;
 
 export type UsageCandidate = {
   workspaceId: string;
@@ -221,11 +224,13 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
 
 export async function uploadSessionBundle(
   sessionBundle: string,
+  signal: AbortSignal,
   dependencies: UploadDependencies = {
     spawn: (command, args, options) =>
       spawn(command, args, options) as unknown as UploadChild
   }
 ): Promise<void> {
+  if (signal.aborted) throw abortError(signal);
   const command = process.platform === "win32" ? "npx.cmd" : "npx";
   await new Promise<void>((resolveUpload, rejectUpload) => {
     let child: UploadChild;
@@ -238,31 +243,58 @@ export async function uploadSessionBundle(
       return;
     }
     let settled = false;
-    const timer = setTimeout(() => settle(new Error("Secret 上传超时")), UPLOAD_TIMEOUT_MS);
+    let cancellation: Error | undefined;
+    let timer: ReturnType<typeof setTimeout>;
+    const onError = () => fail(new Error("Secret 上传命令执行失败"));
+    const onStdinError = () => fail(new Error("Secret 上传输入失败"));
+    const onClose = (code: number | null) => {
+      if (cancellation) settle(cancellation);
+      else if (code === 0) settle();
+      else settle(new Error("Secret 上传失败"));
+    };
+    const onAbort = () => {
+      if (settled || cancellation) return;
+      cancellation = abortError(signal);
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      try {
+        child.kill();
+      } catch {
+        // close 事件才代表子进程生命周期结束，取消结果在该事件后结算。
+      }
+    };
+    const cleanUp = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      child.off("error", onError);
+      child.off("close", onClose);
+      child.stdin.off("error", onStdinError);
+    };
     const settle = (error?: Error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      if (error) {
-        try {
-          child.kill();
-        } finally {
-          rejectUpload(error);
-        }
-      } else {
-        resolveUpload();
+      cleanUp();
+      if (error) rejectUpload(error);
+      else resolveUpload();
+    };
+    const fail = (error: Error) => {
+      if (settled || cancellation) return;
+      try {
+        child.kill();
+      } finally {
+        settle(error);
       }
     };
-    child.once("error", () => settle(new Error("Secret 上传命令执行失败")));
-    child.once("close", (code) => {
-      if (code === 0) settle();
-      else settle(new Error("Secret 上传失败"));
-    });
-    child.stdin.once("error", () => settle(new Error("Secret 上传输入失败")));
+    timer = setTimeout(() => fail(new Error("Secret 上传超时")), UPLOAD_TIMEOUT_MS);
+    child.once("error", onError);
+    child.once("close", onClose);
+    child.stdin.once("error", onStdinError);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
     try {
       child.stdin.end(sessionBundle, "utf8");
     } catch {
-      settle(new Error("Secret 上传输入失败"));
+      fail(new Error("Secret 上传输入失败"));
     }
   });
 }
@@ -281,7 +313,7 @@ async function main(): Promise<void> {
       snapshot.windows.weekly.usedPercent,
       snapshot.windows.monthly.usedPercent
     ].map((percent) => `${percent}%`).join("\n"));
-    await uploadSessionBundle(JSON.stringify(bundle));
+    await uploadSessionBundle(JSON.stringify(bundle), controller.signal);
   } finally {
     process.off("SIGINT", onSigint);
   }
