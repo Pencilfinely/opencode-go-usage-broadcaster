@@ -76,7 +76,7 @@ curl.exe --get --data-urlencode "cron=*/30 * * * *" --data-urlencode "format=jso
    ```
 
    程序每次投递都会自动附带包含事件 ID、过期时间与签名的完整回调 URL；无需在 PushPlus 单独配置固定回调地址。
-5. 运行授权工具，在其打开的浏览器中人工完成 GitHub 登录，进入目标工作区的 Go 页面并按提示确认：
+5. 运行授权工具，在其打开的浏览器中人工完成 GitHub 登录并进入目标工作区即可；工具会自动打开用量页、校验结果并上传会话，不需要手动进入 Go/Usage 页面、捕获 `_server` 响应或在终端按回车：
 
    ```powershell
    npm run auth:setup

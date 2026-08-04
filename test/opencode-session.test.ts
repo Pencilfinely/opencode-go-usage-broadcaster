@@ -12,9 +12,9 @@ function bundle(
     workspaceId: "workspace-1",
     auth: { cookie: "auth=session-value" },
     request: {
-      url: "https://opencode.ai/_server/usage",
+      url: "https://opencode.ai/workspace/workspace-1/go",
       method: "GET",
-      headers: { accept: "application/json" },
+      headers: { accept: "text/html" },
       ...overrides
     }
   };
@@ -44,16 +44,70 @@ describe("OpenCode 控制台采集器", () => {
     });
     expect(snapshot.windows.monthly.resetAt).toBe("2026-08-04T04:00:00.000Z");
     expect(fetchImpl).toHaveBeenCalledWith(
-      "https://opencode.ai/_server/usage",
+      "https://opencode.ai/workspace/workspace-1/go",
       expect.objectContaining({
         method: "GET",
         redirect: "manual",
         headers: expect.objectContaining({
-          accept: "application/json",
+          accept: "text/html",
           cookie: "auth=session-value"
         })
       })
     );
+  });
+
+  it("允许匹配工作区的隐藏 Go 页面 GET 请求", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(Response.json({
+      rollingUsage: { usagePercent: 49, resetInSec: 3600 },
+      weeklyUsage: { usagePercent: 20, resetInSec: 7200 },
+      monthlyUsage: { usagePercent: 10, resetInSec: 10800 }
+    }));
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle({
+        url: "https://opencode.ai/workspace/workspace-1/go",
+        method: "GET",
+        headers: { accept: "text/html" }
+      }),
+      fetchImpl
+    );
+
+    const snapshot = await source.fetch(new Date("2026-08-04T01:00:00Z"));
+
+    expect(snapshot.windows).toMatchObject({
+      rolling: { usedPercent: 49, resetAt: "2026-08-04T02:00:00.000Z" },
+      weekly: { usedPercent: 20, resetAt: "2026-08-04T03:00:00.000Z" },
+      monthly: { usedPercent: 10, resetAt: "2026-08-04T04:00:00.000Z" }
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://opencode.ai/workspace/workspace-1/go",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("从 HTML 脚本中的两种赋值形式解析三个用量窗口", async () => {
+    const html = `<!doctype html><script>
+      rollingUsage:$R[12]={status:"ok",resetInSec:3600,usagePercent:49};
+      weeklyUsage={status:"ok",resetInSec:7200,usagePercent:20};
+      monthlyUsage:$R[3]={status:"rate-limited",resetInSec:10800,usagePercent:100};
+    </script>`;
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(html, {
+        headers: { "content-type": "text/html; charset=utf-8" }
+      }))
+    );
+
+    const snapshot = await source.fetch(new Date("2026-08-04T01:00:00Z"));
+
+    expect(snapshot.windows).toMatchObject({
+      rolling: { usedPercent: 49, resetAt: "2026-08-04T02:00:00.000Z" },
+      weekly: { usedPercent: 20, resetAt: "2026-08-04T03:00:00.000Z" },
+      monthly: {
+        status: "rate-limited",
+        usedPercent: 100,
+        resetAt: "2026-08-04T04:00:00.000Z"
+      }
+    });
   });
 
   it("将未认证响应归类为认证错误", async () => {
@@ -112,7 +166,27 @@ describe("OpenCode 控制台采集器", () => {
   it("拒绝越出 OpenCode 固定来源边界的请求", async () => {
     const fetchImpl = vi.fn();
     const source = new OpenCodeConsoleQuotaSource(
-      bundle({ url: "https://example.test/_server/usage" }),
+      bundle({ url: "https://example.test/workspace/workspace-1/go" }),
+      fetchImpl
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "schema"
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["工作区不匹配", "https://opencode.ai/workspace/workspace-2/go", "GET"],
+    ["旧版内部接口", "https://opencode.ai/_server/usage", "GET"],
+    ["跨源", "https://example.test/workspace/workspace-1/go", "GET"],
+    ["相似路径", "https://opencode.ai/workspace/workspace-1/go-extra", "GET"],
+    ["附带查询参数", "https://opencode.ai/workspace/workspace-1/go?next=/auth", "GET"],
+    ["非 GET 方法", "https://opencode.ai/workspace/workspace-1/go", "POST"]
+  ])("拒绝%s的隐藏 Go 页面请求", async (_case, url, method) => {
+    const fetchImpl = vi.fn();
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle({ url, method }),
       fetchImpl
     );
 

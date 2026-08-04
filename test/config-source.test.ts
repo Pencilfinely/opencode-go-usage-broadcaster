@@ -99,9 +99,9 @@ describe("quota source boundary", () => {
       workspaceId: "workspace-1",
       auth: { cookie: "auth=session-value" },
       request: {
-        url: "https://opencode.ai/_server/usage",
+        url: "https://opencode.ai/workspace/workspace-1/go",
         method: "GET",
-        headers: { accept: "application/json" }
+        headers: { accept: "text/html" }
       }
     });
     const config = loadConfig(makeEnv({
@@ -109,16 +109,19 @@ describe("quota source boundary", () => {
       OPENCODE_CONSOLE_ENABLED: "true",
       OPENCODE_SESSION_BUNDLE: sessionBundle
     }));
-    const source = createQuotaSource(config, async () => Response.json({
-      rollingUsage: { usagePercent: 49, resetInSec: 3600 },
-      weeklyUsage: { usagePercent: 20, resetInSec: 7200 },
-      monthlyUsage: { usagePercent: 10, resetInSec: 10800 }
-    }));
+    const source = createQuotaSource(config, async () => new Response(`
+      <script>
+        rollingUsage={status:"ok",resetInSec:3600,usagePercent:49};
+        weeklyUsage:$R[5]={status:"ok",resetInSec:7200,usagePercent:20};
+        monthlyUsage={status:"ok",resetInSec:10800,usagePercent:10};
+      </script>
+    `, { headers: { "content-type": "text/html" } }));
 
     const snapshot = await source.fetch(new Date("2026-08-04T01:00:00Z"));
 
     expect(config.authGeneration).toBe("bundle-generation");
     expect(snapshot.source).toBe("opencode-console");
+    expect(snapshot.windows.rolling.usedPercent).toBe(49);
   });
 
   it("将损坏或缺失的会话包延迟到来源抓取时归类为结构错误", async () => {

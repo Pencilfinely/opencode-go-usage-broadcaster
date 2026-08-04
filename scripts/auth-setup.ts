@@ -3,33 +3,28 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { chromium, type BrowserContext, type Response } from "playwright-core";
+import { chromium, type BrowserContext } from "playwright-core";
 
 import {
-  normalizeOpenCodeUsage,
   parseSessionBundle,
-  validateOpenCodeRequest,
   type OpenCodeSessionBundleV1
 } from "../src/opencode-session";
 import { OpenCodeConsoleQuotaSource } from "../src/source";
 
 const AUTH_URL = "https://opencode.ai/auth";
 const OPENCODE_ORIGIN = "https://opencode.ai";
-const TARGET_PATH = "/_server";
 const UPLOAD_SECRET_NAME = "OPENCODE_SESSION_BUNDLE";
 const UPLOAD_TIMEOUT_MS = 30_000;
+const WRANGLER_CLI = fileURLToPath(
+  new URL("../node_modules/wrangler/bin/wrangler.js", import.meta.url)
+);
 
 export type UploadChild = Pick<
   ChildProcessWithoutNullStreams,
   "stdin" | "once" | "off" | "kill"
 >;
-
-export type UsageCandidate = {
-  workspaceId: string;
-  request: OpenCodeSessionBundleV1["request"];
-};
 
 export type UploadSpawnOptions = {
   stdio: ["pipe", "ignore", "inherit"];
@@ -44,44 +39,12 @@ export type UploadDependencies = {
   ) => UploadChild;
 };
 
-function isTargetResponse(response: Response): boolean {
-  try {
-    const url = new URL(response.url());
-    return url.origin === OPENCODE_ORIGIN && url.pathname === TARGET_PATH;
-  } catch {
-    return false;
-  }
-}
-
-function describeRequest(response: Response): OpenCodeSessionBundleV1["request"] | undefined {
-  const request = response.request();
-  const method = request.method().toUpperCase();
-  if (method !== "GET" && method !== "POST") return undefined;
-
-  const headers = Object.fromEntries(
-    Object.entries(request.headers())
-      .filter(([name]) => ["accept", "content-type"].includes(name.toLowerCase()))
-      .map(([name, value]) => [name.toLowerCase(), value])
-  );
-  const body = method === "POST" ? request.postData() ?? undefined : undefined;
-  try {
-    return validateOpenCodeRequest({
-      url: response.url(),
-      method,
-      headers,
-      ...(body === undefined ? {} : { body })
-    });
-  } catch {
-    return undefined;
-  }
-}
-
-function workspaceIdFromUrl(url: string): string | undefined {
+export function workspaceIdFromPageUrl(url: string): string | undefined {
   try {
     const parsed = new URL(url);
     if (parsed.origin !== OPENCODE_ORIGIN) return undefined;
-    const match = /^\/workspace\/([^/]+)\/go\/?$/u.exec(parsed.pathname);
-    return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+    const match = /^\/workspace\/(wrk_[A-Za-z0-9]+)(?:\/|$)/u.exec(parsed.pathname);
+    return match?.[1];
   } catch {
     return undefined;
   }
@@ -89,33 +52,6 @@ function workspaceIdFromUrl(url: string): string | undefined {
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("授权已取消");
-}
-
-export function waitForEnter(
-  message: string,
-  signal: AbortSignal,
-  input: NodeJS.ReadableStream = process.stdin,
-  output: NodeJS.WritableStream = process.stdout
-): Promise<void> {
-  const readline = createInterface({ input, output });
-  return new Promise((resolvePrompt, rejectPrompt) => {
-    let finished = false;
-    const finish = (error?: Error) => {
-      if (finished) return;
-      finished = true;
-      signal.removeEventListener("abort", onAbort);
-      readline.close();
-      if (error) rejectPrompt(error);
-      else resolvePrompt();
-    };
-    const onAbort = () => finish(abortError(signal));
-    if (signal.aborted) {
-      onAbort();
-      return;
-    }
-    signal.addEventListener("abort", onAbort, { once: true });
-    readline.question(message, () => finish());
-  });
 }
 
 async function launchVisibleContext(profileDirectory: string): Promise<BrowserContext> {
@@ -133,35 +69,53 @@ async function launchVisibleContext(profileDirectory: string): Promise<BrowserCo
   throw lastError;
 }
 
-export class UsageCandidateCollector {
-  candidate: UsageCandidate | undefined;
-  private readonly pending = new Set<Promise<void>>();
+type CandidatePause = (signal: AbortSignal) => Promise<void>;
 
-  observe(response: Response): void {
-    if (this.candidate || !isTargetResponse(response)) return;
-    const parsing = this.parse(response).then((candidate) => {
-      if (candidate && !this.candidate) this.candidate = candidate;
-    }).catch(() => undefined);
-    this.pending.add(parsing);
-    void parsing.finally(() => this.pending.delete(parsing));
+async function pauseBeforeCandidateCheck(signal: AbortSignal): Promise<void> {
+  try {
+    await delay(500, undefined, { signal });
+  } catch (error) {
+    if (signal.aborted) throw abortError(signal);
+    throw error;
   }
+}
 
-  async waitForPending(): Promise<void> {
-    await Promise.all([...this.pending]);
-  }
+type PageUrlContext = Pick<BrowserContext, "pages">;
 
-  private async parse(response: Response): Promise<UsageCandidate | undefined> {
-    try {
-      const workspaceId = workspaceIdFromUrl(response.request().frame().page().url());
-      if (!workspaceId) return undefined;
-      const payload: unknown = await response.json();
-      normalizeOpenCodeUsage(payload, new Date());
-      const request = describeRequest(response);
-      return request ? { workspaceId, request } : undefined;
-    } catch {
-      return undefined;
+export async function waitForWorkspaceId(
+  context: PageUrlContext,
+  signal: AbortSignal,
+  pause: CandidatePause = pauseBeforeCandidateCheck
+): Promise<string> {
+  while (true) {
+    signal.throwIfAborted();
+    for (const page of context.pages()) {
+      const workspaceId = workspaceIdFromPageUrl(page.url());
+      if (workspaceId) return workspaceId;
     }
+    await pause(signal);
   }
+}
+
+export function buildSessionBundle(
+  workspaceId: string,
+  authCookie: string
+): OpenCodeSessionBundleV1 {
+  if (!/^wrk_[A-Za-z0-9]+$/u.test(workspaceId)) {
+    throw new Error("工作区 ID 无效");
+  }
+  return parseSessionBundle(JSON.stringify({
+    version: 1,
+    generation: randomUUID(),
+    createdAt: new Date().toISOString(),
+    workspaceId,
+    auth: { cookie: `auth=${authCookie}` },
+    request: {
+      url: `${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`,
+      method: "GET",
+      headers: { accept: "text/html" }
+    }
+  } satisfies OpenCodeSessionBundleV1));
 }
 
 type BrowserProfile = Pick<BrowserContext, "close">;
@@ -186,37 +140,23 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
     signal.throwIfAborted();
     context = await launchVisibleContext(profileDirectory);
     signal.throwIfAborted();
-    const candidates = new UsageCandidateCollector();
-    context.on("response", (response) => candidates.observe(response));
-
     const page = await context.newPage();
     await page.goto(AUTH_URL);
-    console.log("请在打开的浏览器中完成 GitHub 登录，并进入工作区的 Go 页面。");
+    console.log(
+      "请在打开的浏览器中完成 GitHub 登录并进入目标工作区；工具会自动打开用量页并继续。"
+    );
 
-    while (true) {
-      await waitForEnter("完成后按回车继续检查：", signal);
-      await candidates.waitForPending();
-      signal.throwIfAborted();
-      const candidate = candidates.candidate;
-      if (!candidate) {
-        console.log("尚未捕获用量请求，请在 Go 页面刷新后按回车重试。");
-        continue;
-      }
-      const authCookie = (await context.cookies(OPENCODE_ORIGIN)).find((cookie) => cookie.name === "auth");
-      if (!authCookie) {
-        console.log("未检测到 OpenCode auth Cookie，请完成登录后重试。");
-        continue;
-      }
-      signal.throwIfAborted();
-      return parseSessionBundle(JSON.stringify({
-        version: 1,
-        generation: randomUUID(),
-        createdAt: new Date().toISOString(),
-        workspaceId: candidate.workspaceId,
-        auth: { cookie: `auth=${authCookie.value}` },
-        request: candidate.request
-      } satisfies OpenCodeSessionBundleV1));
+    const workspaceId = await waitForWorkspaceId(context, signal);
+    signal.throwIfAborted();
+    await page.goto(`${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`);
+    const authCookie = (await context.cookies(OPENCODE_ORIGIN)).find(
+      (cookie) => cookie.name === "auth"
+    );
+    if (!authCookie) {
+      throw new Error("已识别工作区，但未检测到 OpenCode auth Cookie");
     }
+    signal.throwIfAborted();
+    return buildSessionBundle(workspaceId, authCookie.value);
   } finally {
     await cleanUpBrowserProfile(context, profileDirectory);
   }
@@ -231,11 +171,11 @@ export async function uploadSessionBundle(
   }
 ): Promise<void> {
   if (signal.aborted) throw abortError(signal);
-  const command = process.platform === "win32" ? "npx.cmd" : "npx";
+  const command = process.execPath;
   await new Promise<void>((resolveUpload, rejectUpload) => {
     let child: UploadChild;
     try {
-      child = dependencies.spawn(command, ["wrangler", "secret", "put", UPLOAD_SECRET_NAME], {
+      child = dependencies.spawn(command, [WRANGLER_CLI, "secret", "put", UPLOAD_SECRET_NAME], {
         stdio: ["pipe", "ignore", "inherit"]
       });
     } catch {

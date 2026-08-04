@@ -17,6 +17,7 @@ export interface OpenCodeSessionBundleV1 {
 }
 
 type UsagePayload = {
+  status?: "ok" | "rate-limited";
   usagePercent: number;
   resetInSec: number;
 };
@@ -62,7 +63,8 @@ function parseHeaders(value: unknown): Record<string, string> {
 }
 
 export function validateOpenCodeRequest(
-  request: OpenCodeSessionBundleV1["request"]
+  request: OpenCodeSessionBundleV1["request"],
+  workspaceId: string
 ): OpenCodeSessionBundleV1["request"] {
   let url: URL;
   try {
@@ -70,19 +72,23 @@ export function validateOpenCodeRequest(
   } catch {
     throw new SourceError("schema", "会话包请求 URL 无效");
   }
+  const method = request.method.toUpperCase();
+  const workspacePathAllowed = method === "GET" &&
+    url.pathname === `/workspace/${encodeURIComponent(workspaceId)}/go` &&
+    url.search === "" &&
+    url.hash === "";
   if (
     url.protocol !== "https:" ||
     url.hostname !== "opencode.ai" ||
     (url.port !== "" && url.port !== "443") ||
     url.username ||
     url.password ||
-    (url.pathname !== "/_server" && !url.pathname.startsWith("/_server/"))
+    !workspacePathAllowed
   ) {
     throw new SourceError("schema", "会话包请求超出允许来源");
   }
 
-  const method = request.method.toUpperCase();
-  if (method !== "GET" && method !== "POST") {
+  if (method !== "GET") {
     throw new SourceError("schema", "会话包请求方法无效");
   }
   if (method === "GET" && request.body !== undefined) {
@@ -147,7 +153,7 @@ export function parseSessionBundle(raw: string): OpenCodeSessionBundleV1 {
       ? {}
       : { body: nonEmptyString(value.request.body, "request.body") })
   };
-  const request = validateOpenCodeRequest(rawRequest);
+  const request = validateOpenCodeRequest(rawRequest, workspaceId);
   return { version: 1, generation, createdAt, workspaceId, auth: { cookie }, request };
 }
 
@@ -157,6 +163,7 @@ export function readBundleGeneration(raw: string): string {
 
 function isUsagePayload(value: unknown): value is UsagePayload {
   return record(value) &&
+    (value.status === undefined || value.status === "ok" || value.status === "rate-limited") &&
     typeof value.usagePercent === "number" &&
     Number.isFinite(value.usagePercent) &&
     value.usagePercent >= 0 &&
@@ -164,6 +171,53 @@ function isUsagePayload(value: unknown): value is UsagePayload {
     typeof value.resetInSec === "number" &&
     Number.isFinite(value.resetInSec) &&
     value.resetInSec >= 0;
+}
+
+function parseHtmlUsageWindow(
+  html: string,
+  key: "rollingUsage" | "weeklyUsage" | "monthlyUsage"
+): UsagePayload | undefined {
+  const assignment = new RegExp(
+    `${key}\\s*(?::\\s*\\$R\\[\\d+\\])?\\s*=\\s*\\{([^{}]*)\\}`,
+    "u"
+  ).exec(html);
+  const status = assignment?.[1]
+    ? /(?:^|,)\s*status\s*:\s*["'](ok|rate-limited)["']\s*(?:,|$)/u.exec(assignment[1])
+    : undefined;
+  if (!assignment?.[1] || (status?.[1] !== "ok" && status?.[1] !== "rate-limited")) {
+    return undefined;
+  }
+  const numberSource = "(-?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][+-]?\\d+)?)";
+  const reset = new RegExp(
+    `(?:^|,)\\s*resetInSec\\s*:\\s*${numberSource}\\s*(?:,|$)`,
+    "u"
+  ).exec(assignment[1]);
+  const usage = new RegExp(
+    `(?:^|,)\\s*usagePercent\\s*:\\s*${numberSource}\\s*(?:,|$)`,
+    "u"
+  ).exec(assignment[1]);
+  if (reset?.[1] === undefined || usage?.[1] === undefined) return undefined;
+  return {
+    status: status[1],
+    resetInSec: Number(reset[1]),
+    usagePercent: Number(usage[1])
+  };
+}
+
+export function parseOpenCodeUsageResponse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const usages = {
+      rollingUsage: parseHtmlUsageWindow(text, "rollingUsage"),
+      weeklyUsage: parseHtmlUsageWindow(text, "weeklyUsage"),
+      monthlyUsage: parseHtmlUsageWindow(text, "monthlyUsage")
+    };
+    if (!usages.rollingUsage || !usages.weeklyUsage || !usages.monthlyUsage) {
+      throw new SourceError("schema", "响应不是有效 JSON 或用量页面");
+    }
+    return usages;
+  }
 }
 
 function findUsageWindows(value: unknown): Record<
@@ -210,7 +264,7 @@ export function normalizeOpenCodeUsage(
       throw new SourceError("schema", "响应重置时间无效");
     }
     return [key, {
-      status: "ok",
+      status: usage.status ?? "ok",
       usedPercent: usage.usagePercent,
       resetAt: new Date(resetAt).toISOString()
     }];
