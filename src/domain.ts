@@ -10,7 +10,7 @@ export interface UsageWindow {
 }
 
 export interface QuotaSnapshot {
-  source: "fixture";
+  source: "fixture" | "opencode-console";
   observedAt: string;
   windows: Record<WindowKey, UsageWindow>;
 }

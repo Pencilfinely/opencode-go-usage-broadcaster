@@ -1,8 +1,11 @@
+import { parseSessionBundle, type OpenCodeSessionBundleV1 } from "./opencode-session";
+
 export interface AppConfig {
   sourceName: "fixture" | "opencode-console";
   fixtureJson: string;
   consoleEnabled: boolean;
   authGeneration: string;
+  sessionBundle?: OpenCodeSessionBundleV1;
   pushplus: {
     token: string;
     topic: string;
@@ -58,14 +61,23 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     throw new Error("PUSHPLUS_CALLBACK_SECRET must be at least 32 characters");
   }
 
+  const consoleEnabled = bindings.OPENCODE_CONSOLE_ENABLED === "true";
+  const sessionBundle = sourceName === "opencode-console" && consoleEnabled
+    ? parseSessionBundle(required(
+      bindings.OPENCODE_SESSION_BUNDLE,
+      "OPENCODE_SESSION_BUNDLE"
+    ))
+    : undefined;
+
   return {
     sourceName,
     fixtureJson: bindings.USAGE_FIXTURE_JSON ?? "",
-    consoleEnabled: bindings.OPENCODE_CONSOLE_ENABLED === "true",
-    authGeneration: required(
+    consoleEnabled,
+    authGeneration: sessionBundle?.generation ?? required(
       bindings.OPENCODE_AUTH_GENERATION,
       "OPENCODE_AUTH_GENERATION"
     ),
+    ...(sessionBundle === undefined ? {} : { sessionBundle }),
     pushplus: {
       token: required(bindings.PUSHPLUS_TOKEN, "PUSHPLUS_TOKEN"),
       topic: required(bindings.PUSHPLUS_TOPIC, "PUSHPLUS_TOPIC"),

@@ -15,6 +15,7 @@ type ConfigBindingOverrides = Partial<
   USAGE_SOURCE?: string;
   USAGE_FIXTURE_JSON?: string;
   OPENCODE_CONSOLE_ENABLED?: string;
+  OPENCODE_SESSION_BUNDLE?: string;
 };
 
 function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
@@ -55,12 +56,12 @@ describe("quota source boundary", () => {
     });
   });
 
-  it("never performs a console request in the MVP", async () => {
+  it("在显式开关关闭时不执行控制台请求", async () => {
     const source = createQuotaSource(
       loadConfig(
         makeEnv({
           USAGE_SOURCE: "opencode-console",
-          OPENCODE_CONSOLE_ENABLED: "true"
+          OPENCODE_CONSOLE_ENABLED: "false"
         })
       )
     );
@@ -68,7 +69,7 @@ describe("quota source boundary", () => {
     let fetchCalls = 0;
     globalThis.fetch = (async () => {
       fetchCalls += 1;
-      throw new Error("Disabled console source must not call fetch");
+      throw new Error("禁用的控制台来源不得调用 fetch");
     }) as typeof fetch;
 
     try {
@@ -80,5 +81,35 @@ describe("quota source boundary", () => {
     }
 
     expect(fetchCalls).toBe(0);
+  });
+
+  it("启用控制台来源时使用会话包代次", async () => {
+    const sessionBundle = JSON.stringify({
+      version: 1,
+      generation: "bundle-generation",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      workspaceId: "workspace-1",
+      auth: { cookie: "auth=session-value" },
+      request: {
+        url: "https://opencode.ai/_server/usage",
+        method: "GET",
+        headers: { accept: "application/json" }
+      }
+    });
+    const config = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: sessionBundle
+    }));
+    const source = createQuotaSource(config, async () => Response.json({
+      rollingUsage: { usagePercent: 49, resetInSec: 3600 },
+      weeklyUsage: { usagePercent: 20, resetInSec: 7200 },
+      monthlyUsage: { usagePercent: 10, resetInSec: 10800 }
+    }));
+
+    const snapshot = await source.fetch(new Date("2026-08-04T01:00:00Z"));
+
+    expect(config.authGeneration).toBe("bundle-generation");
+    expect(snapshot.source).toBe("opencode-console");
   });
 });

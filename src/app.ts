@@ -46,6 +46,7 @@ export interface RuntimeState {
 export interface AppDeps {
   source?: QuotaSource;
   fetchImpl?: typeof fetch;
+  sourceFetchImpl?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
 }
@@ -204,7 +205,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function validateSnapshot(snapshot: unknown): number {
   if (
     !isRecord(snapshot) ||
-    snapshot.source !== "fixture" ||
+    (snapshot.source !== "fixture" && snapshot.source !== "opencode-console") ||
     typeof snapshot.observedAt !== "string" ||
     !isRecord(snapshot.windows)
   ) {
@@ -294,7 +295,10 @@ export async function runScheduled(
   if (!Number.isFinite(scheduledAt)) {
     throw new Error("scheduledTime must be finite");
   }
-  const source = deps.source ?? createQuotaSource(config);
+  const source = deps.source ?? createQuotaSource(
+    config,
+    deps.sourceFetchImpl ?? fetch
+  );
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? defaultSleep;
 
