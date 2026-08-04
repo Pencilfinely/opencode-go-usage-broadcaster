@@ -304,6 +304,7 @@ export async function runBroadcast(
   const clock = deps.now ?? Date.now;
   const now = clock();
   const scheduledAt = trigger.occurredAt;
+  const isScheduled = trigger.type === "scheduled";
   if (!Number.isFinite(scheduledAt)) {
     throw new Error("occurredAt must be finite");
   }
@@ -343,7 +344,7 @@ export async function runBroadcast(
         await repo.loadState<RuntimeState>("runtime")
       );
 
-      if (scheduledAt <= runtime.version) {
+      if (isScheduled && scheduledAt <= runtime.version) {
         await repo.commitSnapshotUnderLease({
           owner,
           now,
@@ -359,14 +360,14 @@ export async function runBroadcast(
       if (
         runtime.faults.auth?.authGeneration === config.authGeneration
       ) {
-        runtime.version = scheduledAt;
+        if (isScheduled) runtime.version = scheduledAt;
         await repo.commitSnapshotUnderLease({
           owner,
           now,
           jobKey,
           jobStatus: "skipped",
           errorKind: "auth-blocked",
-          states: [{ key: "runtime", value: runtime, version: scheduledAt }],
+          states: [{ key: "runtime", value: runtime, version: now }],
           events: []
         });
         return "completed";
@@ -379,7 +380,7 @@ export async function runBroadcast(
         observedAt = validateSnapshot(snapshot);
       } catch (error) {
         const errorKind = classify(error);
-        runtime.version = scheduledAt;
+        if (isScheduled) runtime.version = scheduledAt;
         const events: NewOutboxEvent[] = [];
         const prefix = fixturePrefix(config.sourceName);
 
@@ -390,7 +391,7 @@ export async function runBroadcast(
             jobKey,
             jobStatus: "skipped",
             errorKind,
-            states: [{ key: "runtime", value: runtime, version: scheduledAt }],
+            states: [{ key: "runtime", value: runtime, version: now }],
             events
           });
           return "completed";
@@ -470,7 +471,7 @@ export async function runBroadcast(
           jobKey,
           jobStatus: "failed",
           errorKind,
-          states: [{ key: "runtime", value: runtime, version: scheduledAt }],
+          states: [{ key: "runtime", value: runtime, version: now }],
           events
         });
         return "completed";
@@ -511,8 +512,7 @@ export async function runBroadcast(
         delete runtime.faults[faultKind];
       }
       runtime.transientRegularSlots = [];
-      runtime.version = scheduledAt;
-      evaluation.state.observationVersion = scheduledAt;
+      if (isScheduled) runtime.version = scheduledAt;
 
       await repo.commitSnapshotUnderLease({
         owner,
@@ -520,8 +520,8 @@ export async function runBroadcast(
         jobKey,
         jobStatus: "succeeded",
         states: [
-          { key: "quota", value: evaluation.state, version: scheduledAt },
-          { key: "runtime", value: runtime, version: scheduledAt }
+          { key: "quota", value: evaluation.state, version: now },
+          { key: "runtime", value: runtime, version: now }
         ],
         events
       });

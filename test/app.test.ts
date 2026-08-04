@@ -159,6 +159,93 @@ describe("定时广播编排", () => {
     expect(sourceFetch).toHaveBeenCalledTimes(1);
   });
 
+  it("手动广播先执行时不取消延迟到达的定时整点", async () => {
+    const scheduledAt = Date.parse("2026-08-05T02:00:00Z");
+    const manualAt = Date.parse("2026-08-05T02:30:00Z");
+    const delayedNow = Date.parse("2026-08-05T02:31:00Z");
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    await runBroadcast(
+      { type: "manual", occurredAt: manualAt, idempotencyDigest: "manual-first" },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, manualAt)) },
+        fetchImpl: pushFetch,
+        now: () => manualAt
+      }
+    );
+    await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(21, delayedNow)) },
+        fetchImpl: pushFetch,
+        now: () => delayedNow
+      }
+    );
+
+    const events = await env.DB.prepare(
+      "SELECT logical_key FROM outbox_events ORDER BY logical_key"
+    ).all<{ logical_key: string }>();
+    expect(events.results.map((event) => event.logical_key)).toEqual([
+      "broadcast:manual:manual-first",
+      "broadcast:scheduled:2026-08-05:10"
+    ]);
+    const runtime = await env.DB.prepare(
+      "SELECT value_json FROM runtime_state WHERE key = 'runtime'"
+    ).first<{ value_json: string }>();
+    expect(JSON.parse(runtime!.value_json).version).toBe(scheduledAt);
+  });
+
+  it("定时整点先执行时不取消同刻之前发生的手动广播", async () => {
+    const scheduledAt = Date.parse("2026-08-05T02:00:00Z");
+    const manualAt = Date.parse("2026-08-05T01:30:00Z");
+    const manualNow = Date.parse("2026-08-05T02:01:00Z");
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        fetchImpl: pushFetch,
+        now: () => scheduledAt
+      }
+    );
+    await runBroadcast(
+      { type: "manual", occurredAt: manualAt, idempotencyDigest: "scheduled-first" },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(21, manualNow)) },
+        fetchImpl: pushFetch,
+        now: () => manualNow
+      }
+    );
+
+    const events = await env.DB.prepare(
+      "SELECT logical_key FROM outbox_events ORDER BY logical_key"
+    ).all<{ logical_key: string }>();
+    expect(events.results.map((event) => event.logical_key)).toEqual([
+      "broadcast:manual:scheduled-first",
+      "broadcast:scheduled:2026-08-05:10"
+    ]);
+    const states = await env.DB.prepare(
+      "SELECT key, value_json FROM runtime_state ORDER BY key"
+    ).all<{ key: string; value_json: string }>();
+    const quota = JSON.parse(
+      states.results.find((state) => state.key === "quota")!.value_json
+    );
+    const runtime = JSON.parse(
+      states.results.find((state) => state.key === "runtime")!.value_json
+    );
+    expect(quota.windows.rolling.usedPercent).toBe(21);
+    expect(runtime.version).toBe(scheduledAt);
+  });
+
   it("阈值跨越只更新额度状态且每个整点仍生成汇总", async () => {
     const source: QuotaSource = {
       fetch: vi
