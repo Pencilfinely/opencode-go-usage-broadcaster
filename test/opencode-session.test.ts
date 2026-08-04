@@ -84,6 +84,25 @@ describe("OpenCode 控制台采集器", () => {
     );
   });
 
+  it("调用全局 fetch 时不把采集器实例绑定为接收者", async () => {
+    let receiver: unknown = "尚未调用";
+    const fetchImpl = function (this: unknown): Promise<Response> {
+      receiver = this;
+      if (this !== undefined) throw new TypeError("Illegal invocation");
+      return Promise.resolve(Response.json({
+        rollingUsage: { usagePercent: 49, resetInSec: 3600 },
+        weeklyUsage: { usagePercent: 20, resetInSec: 7200 },
+        monthlyUsage: { usagePercent: 10, resetInSec: 10800 }
+      }));
+    } as typeof fetch;
+    const source = new OpenCodeConsoleQuotaSource(bundle(), fetchImpl);
+
+    await expect(source.fetch(new Date("2026-08-04T01:00:00Z"))).resolves.toMatchObject({
+      source: "opencode-console"
+    });
+    expect(receiver).toBeUndefined();
+  });
+
   it("从 HTML 脚本中的两种赋值形式解析三个用量窗口", async () => {
     const html = `<!doctype html><script>
       rollingUsage:$R[12]={status:"ok",resetInSec:3600,usagePercent:49};

@@ -153,12 +153,13 @@ export class OpenCodeConsoleQuotaSource implements QuotaSource {
       ? parseSessionBundle(this.rawBundle)
       : this.rawBundle;
     const request = validateOpenCodeRequest(bundle.request, bundle.workspaceId);
+    const fetchImpl = this.fetchImpl;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
     try {
       let response: Response;
       try {
-        response = await this.fetchImpl(request.url, {
+        response = await fetchImpl(request.url, {
           method: request.method,
           headers: { ...request.headers, cookie: bundle.auth.cookie },
           ...(request.body === undefined ? {} : { body: request.body }),
