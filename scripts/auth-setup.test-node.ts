@@ -160,6 +160,17 @@ test("从目标工作区页及其子页识别受限的工作区 ID", async () =>
   assert.equal(workspaceIdFromPageUrl?.("https://opencode.ai/workspace/not-safe"), undefined);
 });
 
+test("为工作区生成官方 usage 页面地址", async () => {
+  const module = await import("./auth-setup");
+  const workspaceUsageUrl = (module as Record<string, unknown>)
+    .workspaceUsageUrl as ((workspaceId: string) => string) | undefined;
+
+  assert.equal(
+    workspaceUsageUrl?.("wrk_Target9"),
+    "https://opencode.ai/workspace/wrk_Target9/usage"
+  );
+});
+
 test("轮询当前及上下文页面直到识别目标工作区", async () => {
   const module = await import("./auth-setup");
   const waitForWorkspaceId = (module as Record<string, unknown>)

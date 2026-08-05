@@ -80,6 +80,10 @@ export function workspaceIdFromPageUrl(url: string): string | undefined {
   }
 }
 
+export function workspaceUsageUrl(workspaceId: string): string {
+  return `${OPENCODE_ORIGIN}/workspace/${encodeURIComponent(workspaceId)}/usage`;
+}
+
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("授权已取消");
 }
@@ -176,7 +180,7 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
     const page0 = await waitBeforeTrigger(
       signal,
       (waiterSignal) => waitForUsageListPage(page, waiterSignal),
-      (triggerSignal) => page.goto(`${OPENCODE_ORIGIN}/usage`, { signal: triggerSignal })
+      (triggerSignal) => page.goto(workspaceUsageUrl(workspaceId), { signal: triggerSignal })
         .then(() => undefined)
     );
     const usageList: OpenCodeSessionBundleV2["usageList"] = page0.records.length < 50
