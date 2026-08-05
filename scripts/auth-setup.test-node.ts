@@ -9,6 +9,86 @@ import {
   type UploadChild
 } from "./auth-setup";
 
+type FakeUsageResponse = ReturnType<typeof makeUsageResponse>;
+
+function makeUsageResponse(options: {
+  url: string;
+  method?: string;
+  requestBody?: string;
+  headers?: Record<string, string>;
+  onReadRequestBody?: () => void;
+}): {
+  ok(): boolean;
+  url(): string;
+  request(): {
+    url(): string;
+    method(): string;
+    headers(): Record<string, string>;
+    postData(): string | null;
+  };
+  body(): Promise<Buffer>;
+  headers(): Record<string, string>;
+} {
+  const method = options.method ?? "GET";
+  return {
+    ok: () => true,
+    url: () => options.url,
+    request: () => ({
+      url: () => options.url,
+      method: () => method,
+      headers: () => options.headers ?? ({
+        accept: "text/javascript",
+        "content-type": "application/json",
+        "x-server-id": serverFunctionId,
+        "x-server-instance": "server-fn:0"
+      }),
+      postData: () => {
+        options.onReadRequestBody?.();
+        return options.requestBody ?? null;
+      }
+    }),
+    body: async () => Buffer.from("[]", "utf8"),
+    headers: () => ({ "content-type": "application/json" })
+  };
+}
+
+function pageWithResponses(responses: FakeUsageResponse[]): {
+  waitForResponse(
+    predicate: (response: FakeUsageResponse) => boolean | Promise<boolean>
+  ): Promise<FakeUsageResponse>;
+} {
+  return {
+    async waitForResponse(predicate) {
+      for (const response of responses) {
+        if (await predicate(response)) return response;
+      }
+      throw new Error("没有响应通过捕获谓词");
+    }
+  };
+}
+
+const serovalUsageArgs = (workspaceId: string, page: number) => JSON.stringify({
+  t: {
+    t: 9,
+    i: 0,
+    l: 2,
+    a: [{ t: 1, s: workspaceId }, { t: 0, s: page }],
+    o: 0
+  },
+  f: 31,
+  m: []
+});
+
+const serverFunctionId = "a".repeat(64);
+
+function usageGetUrl(workspaceId: string, page: number, id = serverFunctionId): string {
+  const search = new URLSearchParams({
+    id,
+    args: serovalUsageArgs(workspaceId, page)
+  });
+  return `https://opencode.ai/_server?${search.toString()}`;
+}
+
 test("触发失败时取消内部 waiter 并回收其拒绝后重抛原始错误", async () => {
   const module = await import("./opencode-usage-capture");
   const waitBeforeTrigger = (module as Record<string, unknown>)
@@ -54,25 +134,179 @@ test("只保留捕获请求的必要头", async () => {
     }) => unknown) | undefined;
 
   assert.deepEqual(minimizeCapturedRequest?.({
-    url: "https://opencode.ai/_server?id=usage.list",
-    method: "POST",
+    url: usageGetUrl("wrk_abc", 0),
+    method: "GET",
     headers: {
       accept: "text/javascript",
       "content-type": "application/json",
+      "x-server-id": serverFunctionId,
+      "x-server-instance": "server-fn:0",
       cookie: "不得进入结果",
       origin: "https://opencode.ai",
       "x-test": "不得进入结果"
     },
-    body: '["wrk_abc",0]'
   }), {
-    url: "https://opencode.ai/_server?id=usage.list",
-    method: "POST",
+    url: usageGetUrl("wrk_abc", 0),
+    method: "GET",
     headers: {
-      accept: "text/javascript",
-      "content-type": "application/json"
-    },
-    body: '["wrk_abc",0]'
+      accept: "text/javascript"
+    }
   });
+});
+
+test("按工作区和期望页识别真实 GET usage 请求，并跳过错误页和错误函数 ID", async () => {
+  const module = await import("./opencode-usage-capture");
+  const waitForUsageListPage = (module as Record<string, unknown>)
+    .waitForUsageListPage as ((
+      page: unknown,
+      workspaceId: string,
+      expectedPage: number,
+      signal: AbortSignal
+    ) => Promise<{ request: { url: string; method: string; body?: string } }>) | undefined;
+  if (!waitForUsageListPage) throw new Error("缺少 usage 页面捕获器");
+  const wrongPage = makeUsageResponse({
+    url: usageGetUrl("wrk_Target9", 1)
+  });
+  const mismatchedId = makeUsageResponse({
+    url: usageGetUrl("wrk_Target9", 0),
+    headers: {
+      "x-server-id": "b".repeat(64),
+      "x-server-instance": "server-fn:0"
+    }
+  });
+  const semanticId = makeUsageResponse({
+    url: usageGetUrl("wrk_Target9", 0, "usage.list"),
+    headers: {
+      "x-server-id": "usage.list",
+      "x-server-instance": "server-fn:0"
+    }
+  });
+  const malformedInstance = makeUsageResponse({
+    url: usageGetUrl("wrk_Target9", 0),
+    headers: {
+      "x-server-id": serverFunctionId,
+      "x-server-instance": "server-fn:-1"
+    }
+  });
+  const expectedPage = makeUsageResponse({
+    url: usageGetUrl("wrk_Target9", 0)
+  });
+
+  const captured = await waitForUsageListPage(
+    pageWithResponses([wrongPage, mismatchedId, semanticId, malformedInstance, expectedPage]),
+    "wrk_Target9",
+    0,
+    new AbortController().signal
+  );
+
+  assert.equal(captured.request.url, usageGetUrl("wrk_Target9", 0));
+  assert.equal(captured.request.method, "GET");
+  assert.equal(captured.request.body, undefined);
+});
+
+test("粗筛选同源无关请求时不读取请求体", async () => {
+  const module = await import("./opencode-usage-capture");
+  const waitForUsageListPage = (module as Record<string, unknown>)
+    .waitForUsageListPage as ((
+      page: unknown,
+      workspaceId: string,
+      expectedPage: number,
+      signal: AbortSignal
+    ) => Promise<unknown>) | undefined;
+  if (!waitForUsageListPage) throw new Error("缺少 usage 页面捕获器");
+  let unrelatedBodyReads = 0;
+  const unrelated = makeUsageResponse({
+    url: "https://opencode.ai/api/upload",
+    onReadRequestBody: () => {
+      unrelatedBodyReads += 1;
+      throw new Error("无关请求体不得读取");
+    }
+  });
+  const expectedPage = makeUsageResponse({
+    url: usageGetUrl("wrk_Target9", 0)
+  });
+
+  await waitForUsageListPage(
+    pageWithResponses([unrelated, expectedPage]),
+    "wrk_Target9",
+    0,
+    new AbortController().signal
+  );
+
+  assert.equal(unrelatedBodyReads, 0);
+});
+
+test("从第 0 页 GET 请求派生可回放的第 1 页授权", async () => {
+  const capture = await import("./opencode-usage-capture");
+  const session = await import("../src/opencode-session");
+  const buildUsageGetAuthorization = (capture as Record<string, unknown>)
+    .buildUsageGetAuthorization as ((
+      firstPage: { url: string; method: string; headers: Record<string, string> },
+      workspaceId: string,
+      recordCount: number
+    ) => unknown) | undefined;
+  if (!buildUsageGetAuthorization) throw new Error("缺少 GET usage 授权构建器");
+  const firstPage = {
+    url: usageGetUrl("wrk_Target9", 0),
+    method: "GET",
+    headers: { accept: "text/javascript" }
+  };
+
+  const authorization = buildUsageGetAuthorization(firstPage, "wrk_Target9", 50) as {
+    firstPage: typeof firstPage;
+    pagination: { mode: string; template?: unknown };
+  };
+  assert.equal(authorization.pagination.mode, "paginated");
+  if (!authorization.pagination.template) throw new Error("缺少分页模板");
+  assert.deepEqual(
+    session.renderUsagePageRequest(authorization.firstPage, authorization.pagination.template as never, 0),
+    authorization.firstPage
+  );
+  assert.doesNotThrow(() => session.validateUsageListRequestDescriptor(
+    session.renderUsagePageRequest(authorization.firstPage, authorization.pagination.template as never, 1),
+    "wrk_Target9",
+    1
+  ));
+});
+
+test("第 0 页记录数决定单页或分页授权，并拒绝范围外数量", async () => {
+  const capture = await import("./opencode-usage-capture");
+  const buildUsageGetAuthorization = (capture as Record<string, unknown>)
+    .buildUsageGetAuthorization as ((
+      firstPage: { url: string; method: string; headers: Record<string, string> },
+      workspaceId: string,
+      recordCount: number
+    ) => { pagination: { mode: string } }) | undefined;
+  if (!buildUsageGetAuthorization) throw new Error("缺少 GET usage 授权构建器");
+  const firstPage = {
+    url: usageGetUrl("wrk_Target9", 0),
+    method: "GET",
+    headers: {}
+  };
+
+  assert.equal(buildUsageGetAuthorization(firstPage, "wrk_Target9", 49).pagination.mode, "single-page");
+  assert.equal(buildUsageGetAuthorization(firstPage, "wrk_Target9", 50).pagination.mode, "paginated");
+  assert.throws(() => buildUsageGetAuthorization(firstPage, "wrk_Target9", -1));
+  assert.throws(() => buildUsageGetAuthorization(firstPage, "wrk_Target9", 51));
+});
+
+test("严格验证仅接受精确的 SolidStart GET 请求图", async () => {
+  const session = await import("../src/opencode-session");
+  const firstPage = {
+    url: usageGetUrl("wrk_Target9", 0),
+    method: "GET",
+    headers: {}
+  };
+  assert.doesNotThrow(() => session.validateUsageListRequestDescriptor(firstPage, "wrk_Target9", 0));
+  for (const invalid of [
+    { ...firstPage, method: "POST" },
+    { ...firstPage, body: "forbidden" },
+    { ...firstPage, url: usageGetUrl("wrk_Target9", 0, "usage.list") },
+    { ...firstPage, url: `${firstPage.url}&extra=value` },
+    { ...firstPage, url: `${firstPage.url}#fragment` }
+  ]) {
+    assert.throws(() => session.validateUsageListRequestDescriptor(invalid, "wrk_Target9", 0));
+  }
 });
 
 test("页号模板拒绝 URL 的固定部分变化", async () => {
@@ -215,10 +449,9 @@ test("为已识别工作区构造经严格校验的 V2 会话包", async () => {
     },
     {
       firstPage: {
-        url: "https://opencode.ai/_server?id=usage.list",
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: '["wrk_Target9",0]'
+        url: usageGetUrl("wrk_Target9", 0),
+        method: "GET",
+        headers: {}
       },
       pagination: { mode: "single-page" }
     }

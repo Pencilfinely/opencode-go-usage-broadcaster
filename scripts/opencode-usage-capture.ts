@@ -5,6 +5,7 @@ import type { Page, Response } from "playwright-core";
 import {
   parseSessionBundle,
   parseOpenCodeGoResponse,
+  validateUsageListRequestDescriptor,
   type OpenCodeRequestDescriptor,
   type OpenCodeSessionBundleV2,
   type UsagePageNumberTemplate
@@ -158,6 +159,55 @@ export function deriveUsagePageNumberTemplate(
   return { location: "body", ...deriveUniqueZeroToOneTemplate(page0.body, page1.body) };
 }
 
+export function buildUsageGetAuthorization(
+  firstPage: OpenCodeRequestDescriptor,
+  workspaceId: string,
+  recordCount: number
+): OpenCodeSessionBundleV2["usageList"] {
+  if (!Number.isSafeInteger(recordCount) || recordCount < 0 || recordCount > 50) {
+    throw new Error("usage 第 0 页记录数量必须在 0 到 50 之间");
+  }
+  const validatedFirstPage = validateUsageListRequestDescriptor(firstPage, workspaceId, 0);
+  const firstUrl = new URL(validatedFirstPage.url);
+  const firstArgs = firstUrl.searchParams.get("args");
+  if (firstArgs === null) throw new Error("usage 第 0 页缺少 args");
+
+  const graph = JSON.parse(firstArgs) as {
+    t: { a: [unknown, Record<string, unknown>] };
+  };
+  firstUrl.searchParams.set("args", JSON.stringify(graph));
+  const canonicalFirstPage = validateUsageListRequestDescriptor(
+    { ...validatedFirstPage, url: firstUrl.toString() },
+    workspaceId,
+    0
+  );
+  if (recordCount < 50) {
+    return { firstPage: canonicalFirstPage, pagination: { mode: "single-page" } };
+  }
+
+  const pageOneGraph = {
+    ...graph,
+    t: {
+      ...graph.t,
+      a: [graph.t.a[0], { ...graph.t.a[1], s: 1 }] as [unknown, Record<string, unknown>]
+    }
+  };
+  const pageOneUrl = new URL(canonicalFirstPage.url);
+  pageOneUrl.searchParams.set("args", JSON.stringify(pageOneGraph));
+  const pageOne = validateUsageListRequestDescriptor(
+    { ...canonicalFirstPage, url: pageOneUrl.toString() },
+    workspaceId,
+    1
+  );
+  return {
+    firstPage: canonicalFirstPage,
+    pagination: {
+      mode: "paginated",
+      template: deriveUsagePageNumberTemplate(canonicalFirstPage, pageOne)
+    }
+  };
+}
+
 export function buildSessionBundle(
   workspaceId: string,
   authCookie: string,
@@ -183,6 +233,16 @@ function isSameOrigin(response: Response): boolean {
   } catch {
     return false;
   }
+}
+
+export function hasValidUsageServerHeaders(
+  url: URL,
+  headers: Record<string, string>
+): boolean {
+  const id = url.searchParams.get("id");
+  return id !== null &&
+    headers["x-server-id"] === id &&
+    /^server-fn:[0-9]+$/u.test(headers["x-server-instance"] ?? "");
 }
 
 function requestFromResponse(response: Response): OpenCodeRequestDescriptor {
@@ -223,16 +283,32 @@ export async function waitForGoRequest(
 
 export async function waitForUsageListPage(
   page: Page,
+  workspaceId: string,
+  expectedPage: number,
   signal: AbortSignal,
   accept: (candidate: CapturedUsagePage) => boolean = () => true
 ): Promise<CapturedUsagePage> {
   let accepted: CapturedUsagePage | undefined;
   await page.waitForResponse(async (response) => {
     if (!response.ok() || !isSameOrigin(response)) return false;
-    const request = requestFromResponse(response);
+    const rawRequest = response.request();
+    let url: URL;
     try {
-      const url = new URL(request.url);
-      if (url.pathname !== "/_server" || url.searchParams.get("id") !== "usage.list") return false;
+      url = new URL(rawRequest.url());
+    } catch {
+      return false;
+    }
+    const method = rawRequest.method().toUpperCase();
+    if (url.pathname !== "/_server" || method !== "GET") {
+      return false;
+    }
+    if (!hasValidUsageServerHeaders(url, rawRequest.headers())) return false;
+    try {
+      const request = validateUsageListRequestDescriptor(
+        requestFromResponse(response),
+        workspaceId,
+        expectedPage
+      );
       const text = await responseTextWithinLimit(response);
       const candidate = {
         request,

@@ -53,7 +53,6 @@ type UsagePayload = {
 };
 
 const MAX_REQUEST_BODY_BYTES = 64 * 1024;
-const MAX_USAGE_REQUEST_BODY_BYTES = 16 * 1024;
 const ALLOWED_HEADERS = new Set(["accept", "content-type"]);
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -84,7 +83,10 @@ function parseHeaders(value: unknown): Record<string, string> {
   const headers: Record<string, string> = {};
   for (const [name, headerValue] of Object.entries(value)) {
     const normalizedName = name.toLowerCase();
-    if (!ALLOWED_HEADERS.has(normalizedName) || typeof headerValue !== "string") {
+    if (
+      !ALLOWED_HEADERS.has(normalizedName) ||
+      typeof headerValue !== "string" || headers[normalizedName] !== undefined
+    ) {
       throw new SourceError("schema", "会话包请求头无效");
     }
     headers[normalizedName] = headerValue;
@@ -168,6 +170,11 @@ function validateUsageOrigin(url: URL): void {
   }
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
+}
+
 function findUsageParameters(source: string, workspaceId: string, expectedPage: number): boolean {
   let parsed: unknown;
   try {
@@ -175,11 +182,42 @@ function findUsageParameters(source: string, workspaceId: string, expectedPage: 
   } catch {
     return false;
   }
-  if (!Array.isArray(parsed)) return false;
-  if (parsed.length !== 2 || parsed[0] !== workspaceId || parsed[1] !== expectedPage) {
+  const parameters = parseSerovalUsageParameters(parsed);
+  if (!parameters) return false;
+  if (parameters[0] !== workspaceId || parameters[1] !== expectedPage) {
     throw new SourceError("schema", "usage.list 请求参数无效");
   }
   return true;
+}
+
+function parseSerovalUsageParameters(value: unknown): unknown[] | undefined {
+  if (!record(value) || !hasExactKeys(value, ["t", "f", "m"]) || !record(value.t)) {
+    return undefined;
+  }
+  if (value.f !== 31 || !Array.isArray(value.m) || value.m.length !== 0) return undefined;
+  const root = value.t;
+  if (
+    !hasExactKeys(root, ["t", "i", "l", "a", "o"]) ||
+    root.t !== 9 ||
+    root.i !== 0 ||
+    root.l !== 2 ||
+    root.o !== 0 ||
+    !Array.isArray(root.a) ||
+    root.a.length !== 2
+  ) {
+    return undefined;
+  }
+  const [workspace, page] = root.a;
+  if (
+    !record(workspace) || !hasExactKeys(workspace, ["t", "s"]) ||
+    workspace.t !== 1 || typeof workspace.s !== "string" ||
+    !record(page) || !hasExactKeys(page, ["t", "s"]) ||
+    page.t !== 0 || typeof page.s !== "number" ||
+    !Number.isSafeInteger(page.s) || page.s < 0
+  ) {
+    return undefined;
+  }
+  return [workspace.s, page.s];
 }
 
 export function validateUsageListRequestDescriptor(
@@ -198,40 +236,32 @@ export function validateUsageListRequestDescriptor(
   }
   validateUsageOrigin(url);
   const method = request.method.toUpperCase();
-  if (method !== "GET" && method !== "POST") {
+  if (url.pathname !== "/_server" || method !== "GET") {
     throw new SourceError("schema", "usage.list 请求方法无效");
   }
   const headers = parseHeaders(request.headers);
-  if (method === "GET" && request.body !== undefined) {
+  if (request.body !== undefined) {
     throw new SourceError("schema", "GET 请求不能包含请求体");
   }
-  if (method === "POST" && request.body === undefined) {
-    throw new SourceError("schema", "POST 请求必须包含请求体");
-  }
-  if (method === "POST" && headers["content-type"] === undefined) {
-    throw new SourceError("schema", "POST 请求必须包含 Content-Type");
-  }
+  const idValues = url.searchParams.getAll("id");
+  const argsValues = url.searchParams.getAll("args");
+  const id = idValues[0];
+  const args = argsValues[0];
   if (
-    request.body !== undefined &&
-    new TextEncoder().encode(request.body).byteLength > MAX_USAGE_REQUEST_BODY_BYTES
+    url.searchParams.size !== 2 ||
+    idValues.length !== 1 ||
+    argsValues.length !== 1 ||
+    id === undefined ||
+    args === undefined ||
+    !/^[a-f0-9]{64}$/u.test(id) ||
+    !findUsageParameters(args, workspaceId, expectedPage)
   ) {
-    throw new SourceError("schema", "usage.list 请求体超过限制");
-  }
-  const parameterSources = [
-    ...(request.body === undefined ? [] : [request.body]),
-    ...Array.from(url.searchParams.values())
-  ];
-  const matches = parameterSources.filter((source) =>
-    findUsageParameters(source, workspaceId, expectedPage)
-  );
-  if (matches.length !== 1) {
     throw new SourceError("schema", "usage.list 请求参数不唯一");
   }
   return {
     url: url.toString(),
     method,
-    headers,
-    ...(request.body === undefined ? {} : { body: request.body })
+    headers
   };
 }
 
