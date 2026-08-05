@@ -84,7 +84,12 @@ export async function replayOpenCodeRequest(
     ) {
       throw new SourceError("auth", "OpenCode 会话已失效");
     }
-    if (response.status === 408 || response.status === 429 || response.status >= 500) {
+    if (
+      response.status === 308 ||
+      response.status === 408 ||
+      response.status === 429 ||
+      response.status >= 500
+    ) {
       throw new SourceError("transient", "OpenCode 服务暂时不可用");
     }
     if (!response.ok) {

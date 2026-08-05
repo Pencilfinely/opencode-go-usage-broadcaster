@@ -175,6 +175,20 @@ describe("OpenCode 控制台采集器", () => {
     });
   });
 
+  it("将 308 重定向归类为瞬态错误", async () => {
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(null, {
+        status: 308,
+        headers: { location: "/workspace/workspace-1/go" }
+      }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "transient"
+    });
+  });
+
   it("将跨源 login 重定向归类为结构错误", async () => {
     const source = new OpenCodeConsoleQuotaSource(
       bundle(),
