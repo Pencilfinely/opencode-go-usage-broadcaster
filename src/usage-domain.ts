@@ -46,6 +46,13 @@ export interface UsageHourBucket {
   cacheTokens: number;
 }
 
+export interface UsageChartDataV1 {
+  version: 1;
+  observedAt: number;
+  truncated: boolean;
+  buckets: UsageHourBucket[];
+}
+
 export interface UsageModelTotal {
   model: string;
   tokenCount: number;

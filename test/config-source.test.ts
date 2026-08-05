@@ -19,6 +19,8 @@ type ConfigBindingOverrides = Partial<
     | "OPENCODE_AUTH_GENERATION"
     | "OPENCODE_SESSION_BUNDLE"
     | "MANUAL_TRIGGER_SECRET"
+    | "PUBLIC_BASE_URL"
+    | "USAGE_CHART_SIGNING_SECRET"
   >
 > & {
   USAGE_SOURCE?: string;
@@ -27,6 +29,8 @@ type ConfigBindingOverrides = Partial<
   OPENCODE_AUTH_GENERATION?: string | undefined;
   OPENCODE_SESSION_BUNDLE?: string | undefined;
   MANUAL_TRIGGER_SECRET?: string | undefined;
+  PUBLIC_BASE_URL?: string | undefined;
+  USAGE_CHART_SIGNING_SECRET?: string | undefined;
 };
 
 function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
@@ -40,6 +44,8 @@ function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
     PUSHPLUS_CALLBACK_SECRET: "test-callback-secret-32-bytes-minimum",
     PUSHPLUS_CALLBACK_BASE_URL: "https://worker.test",
     MANUAL_TRIGGER_SECRET: "test-manual-trigger-secret-32-bytes-minimum",
+    PUBLIC_BASE_URL: "https://usage-chart.example.test",
+    USAGE_CHART_SIGNING_SECRET: "test-usage-chart-signing-secret-32-bytes-minimum",
     ...overrides
   } as Cloudflare.Env;
 }
@@ -197,6 +203,21 @@ describe("quota source boundary", () => {
     expect(() => loadConfig(makeEnv({
       MANUAL_TRIGGER_SECRET: secret
     }))).toThrow();
+  });
+
+  it.each([
+    ["HTTP", "http://usage-chart.example.test"],
+    ["凭据", "https://user:pass@usage-chart.example.test"],
+    ["路径", "https://usage-chart.example.test/path"],
+    ["查询", "https://usage-chart.example.test?query=1"],
+    ["片段", "https://usage-chart.example.test#fragment"],
+    ["非标准端口", "https://usage-chart.example.test:8443"]
+  ])("图表公开地址含%s时拒绝加载配置", (_caseName, publicBaseUrl) => {
+    expect(() => loadConfig(makeEnv({ PUBLIC_BASE_URL: publicBaseUrl }))).toThrow();
+  });
+
+  it.each([undefined, "too-short"])('图表签名 Secret 为 %s 时拒绝加载配置', (secret) => {
+    expect(() => loadConfig(makeEnv({ USAGE_CHART_SIGNING_SECRET: secret }))).toThrow();
   });
 
   it("parses all three fixture windows", async () => {

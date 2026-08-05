@@ -3,6 +3,7 @@ import { loadConfig } from "./config";
 import { handleManualTrigger } from "./manual-trigger";
 import { handlePushPlusCallback } from "./pushplus";
 import { Repository } from "./repository";
+import { handleUsageChartRequest } from "./usage-chart";
 
 export default {
   scheduled(controller, env, ctx): void {
@@ -17,6 +18,14 @@ export default {
         request,
         config,
         (trigger) => runBroadcast(trigger, env)
+      );
+    }
+    if (url.pathname.startsWith("/charts/usage/")) {
+      const config = loadConfig(env);
+      return await handleUsageChartRequest(
+        request,
+        config.usageChart,
+        new Repository(env.DB)
       );
     }
     if (

@@ -3,6 +3,7 @@
   "name": "opencode-go-usage-broadcaster",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-03",
+  "preview_urls": true,
   "d1_databases": [
     {
       "binding": "DB",
@@ -18,7 +19,8 @@
     "USAGE_SOURCE": "opencode-console",
     "USAGE_FIXTURE_JSON": "{\"rollingUsage\":{\"status\":\"ok\",\"resetInSec\":3600,\"usagePercent\":49},\"weeklyUsage\":{\"status\":\"ok\",\"resetInSec\":259200,\"usagePercent\":20},\"monthlyUsage\":{\"status\":\"ok\",\"resetInSec\":1209600,\"usagePercent\":10}}",
     "OPENCODE_CONSOLE_ENABLED": "true",
-    "OPENCODE_AUTH_GENERATION": "1"
+    "OPENCODE_AUTH_GENERATION": "1",
+    "PUBLIC_BASE_URL": "https://opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev"
   },
   "secrets": {
     "required": [
@@ -27,7 +29,8 @@
       "PUSHPLUS_CALLBACK_SECRET",
       "PUSHPLUS_CALLBACK_BASE_URL",
       "MANUAL_TRIGGER_SECRET",
-      "OPENCODE_SESSION_BUNDLE"
+      "OPENCODE_SESSION_BUNDLE",
+      "USAGE_CHART_SIGNING_SECRET"
     ]
   }
 }
