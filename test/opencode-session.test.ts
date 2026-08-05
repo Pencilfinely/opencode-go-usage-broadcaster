@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { OpenCodeConsoleQuotaSource } from "../src/source";
-import type { OpenCodeSessionBundleV1 } from "../src/opencode-session";
+import {
+  parseOpenCodeGoResponse,
+  type OpenCodeSessionBundleV1
+} from "../src/opencode-session";
 
 function bundle(
   overrides: Partial<OpenCodeSessionBundleV1["request"]> = {}
@@ -21,6 +24,10 @@ function bundle(
 }
 
 describe("OpenCode 控制台采集器", () => {
+  it("保留 Go 页面 JSON 响应解析", () => {
+    expect(parseOpenCodeGoResponse('{"answer":42}')).toEqual({ answer: 42 });
+  });
+
   it("将嵌套响应中的三个用量窗口规范化为快照", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(Response.json({
       result: {

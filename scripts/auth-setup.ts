@@ -104,7 +104,7 @@ export function buildSessionBundle(
   if (!/^wrk_[A-Za-z0-9]+$/u.test(workspaceId)) {
     throw new Error("工作区 ID 无效");
   }
-  return parseSessionBundle(JSON.stringify({
+  const bundle = parseSessionBundle(JSON.stringify({
     version: 1,
     generation: randomUUID(),
     createdAt: new Date().toISOString(),
@@ -116,6 +116,10 @@ export function buildSessionBundle(
       headers: { accept: "text/html" }
     }
   } satisfies OpenCodeSessionBundleV1));
+  if (bundle.version !== 1) {
+    throw new Error("生成的会话包版本无效");
+  }
+  return bundle;
 }
 
 type BrowserProfile = Pick<BrowserContext, "close">;
