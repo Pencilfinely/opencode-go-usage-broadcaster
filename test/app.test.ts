@@ -37,7 +37,8 @@ function testEnv(): Cloudflare.Env {
     PUSHPLUS_TOKEN: "test-token",
     PUSHPLUS_TOPIC: "test-topic",
     PUSHPLUS_CALLBACK_SECRET: "12345678901234567890123456789012",
-    PUSHPLUS_CALLBACK_BASE_URL: "https://worker.example.test"
+    PUSHPLUS_CALLBACK_BASE_URL: "https://worker.example.test",
+    MANUAL_TRIGGER_SECRET: "test-manual-trigger-secret-32-bytes-minimum"
   } as unknown as Cloudflare.Env;
 }
 

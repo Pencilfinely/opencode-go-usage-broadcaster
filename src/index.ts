@@ -1,5 +1,6 @@
-import { runScheduled } from "./app";
+import { runBroadcast, runScheduled } from "./app";
 import { loadConfig } from "./config";
+import { handleManualTrigger } from "./manual-trigger";
 import { handlePushPlusCallback } from "./pushplus";
 import { Repository } from "./repository";
 
@@ -10,6 +11,14 @@ export default {
 
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/admin/manual-trigger") {
+      const config = loadConfig(env);
+      return await handleManualTrigger(
+        request,
+        config,
+        (trigger) => runBroadcast(trigger, env)
+      );
+    }
     if (
       request.method !== "POST" ||
       !url.pathname.startsWith("/callbacks/pushplus/")
