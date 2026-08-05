@@ -9,6 +9,106 @@ import {
   type UploadChild
 } from "./auth-setup";
 
+test("只保留捕获请求的必要头", async () => {
+  const module = await import("./opencode-usage-capture");
+  const minimizeCapturedRequest = (module as Record<string, unknown>)
+    .minimizeCapturedRequest as ((request: {
+      url: string;
+      method: string;
+      headers: Record<string, string>;
+      body?: string;
+    }) => unknown) | undefined;
+
+  assert.deepEqual(minimizeCapturedRequest?.({
+    url: "https://opencode.ai/_server?id=usage.list",
+    method: "POST",
+    headers: {
+      accept: "text/javascript",
+      "content-type": "application/json",
+      cookie: "不得进入结果",
+      origin: "https://opencode.ai",
+      "x-test": "不得进入结果"
+    },
+    body: '["wrk_abc",0]'
+  }), {
+    url: "https://opencode.ai/_server?id=usage.list",
+    method: "POST",
+    headers: {
+      accept: "text/javascript",
+      "content-type": "application/json"
+    },
+    body: '["wrk_abc",0]'
+  });
+});
+
+test("页号模板拒绝 URL 的固定部分变化", async () => {
+  const module = await import("./opencode-usage-capture");
+  const deriveUsagePageNumberTemplate = (module as Record<string, unknown>)
+    .deriveUsagePageNumberTemplate as ((
+      zero: { url: string; method: string; headers: Record<string, string>; body?: string },
+      one: { url: string; method: string; headers: Record<string, string>; body?: string }
+    ) => unknown) | undefined;
+
+  assert.throws(() => deriveUsagePageNumberTemplate?.(
+    {
+      url: "https://opencode.ai/_server?id=usage.list&source=console",
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '["wrk_abc",0]'
+    },
+    {
+      url: "https://opencode.ai/_server?id=usage.list&source=web",
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '["wrk_abc",1]'
+    }
+  ));
+});
+
+test("页号模板拒绝请求头变化", async () => {
+  const module = await import("./opencode-usage-capture");
+  const deriveUsagePageNumberTemplate = (module as Record<string, unknown>)
+    .deriveUsagePageNumberTemplate as ((
+      zero: { url: string; method: string; headers: Record<string, string>; body?: string },
+      one: { url: string; method: string; headers: Record<string, string>; body?: string }
+    ) => unknown) | undefined;
+
+  assert.throws(() => deriveUsagePageNumberTemplate?.(
+    {
+      url: "https://opencode.ai/_server?id=usage.list",
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '["wrk_abc",0]'
+    },
+    {
+      url: "https://opencode.ai/_server?id=usage.list",
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: '["wrk_abc",1]'
+    }
+  ));
+});
+
+test("版本级模式使用 versions secret put", async () => {
+  const module = await import("./auth-setup");
+  const buildWranglerSecretArgs = (module as Record<string, unknown>)
+    .buildWranglerSecretArgs as ((cli: string, mode: string) => string[]) | undefined;
+
+  assert.deepEqual(buildWranglerSecretArgs?.("wrangler.js", "version-only"), [
+    "wrangler.js", "versions", "secret", "put", "OPENCODE_SESSION_BUNDLE"
+  ]);
+});
+
+test("仅接受可选的版本级上传参数", async () => {
+  const module = await import("./auth-setup");
+  const parseAuthSetupArgs = (module as Record<string, unknown>)
+    .parseAuthSetupArgs as ((argv: readonly string[]) => unknown) | undefined;
+
+  assert.deepEqual(parseAuthSetupArgs?.([]), { uploadMode: "deployed" });
+  assert.deepEqual(parseAuthSetupArgs?.(["--version-only"]), { uploadMode: "version-only" });
+  assert.throws(() => parseAuthSetupArgs?.(["--bad"]));
+});
+
 test("从目标工作区页及其子页识别受限的工作区 ID", async () => {
   const module = await import("./auth-setup");
   const workspaceIdFromPageUrl = (module as Record<string, unknown>)
@@ -50,21 +150,39 @@ test("轮询当前及上下文页面直到识别目标工作区", async () => {
   assert.equal(pauses, 1);
 });
 
-test("为已识别工作区构造最小化的隐藏 Go 页面 GET 会话", async () => {
+test("为已识别工作区构造经严格校验的 V2 会话包", async () => {
   const module = await import("./auth-setup");
   const buildSessionBundle = (module as Record<string, unknown>)
     .buildSessionBundle as (
       workspaceId: string,
-      authCookie: string
-    ) => { workspaceId: string; auth: { cookie: string }; request: {
-      url: string; method: string; headers: Record<string, string>;
-    } };
+      authCookie: string,
+      goRequest: { url: string; method: string; headers: Record<string, string> },
+      usageList: unknown
+    ) => { version: number; workspaceId: string; auth: { cookie: string }; goRequest: unknown };
 
-  const bundle = buildSessionBundle("wrk_Target9", "cookie-value");
+  const bundle = buildSessionBundle(
+    "wrk_Target9",
+    "cookie-value",
+    {
+      url: "https://opencode.ai/workspace/wrk_Target9/go",
+      method: "GET",
+      headers: { accept: "text/html" }
+    },
+    {
+      firstPage: {
+        url: "https://opencode.ai/_server?id=usage.list",
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '["wrk_Target9",0]'
+      },
+      pagination: { mode: "single-page" }
+    }
+  );
 
+  assert.equal(bundle.version, 2);
   assert.equal(bundle.workspaceId, "wrk_Target9");
   assert.equal(bundle.auth.cookie, "auth=cookie-value");
-  assert.deepEqual(bundle.request, {
+  assert.deepEqual(bundle.goRequest, {
     url: "https://opencode.ai/workspace/wrk_Target9/go",
     method: "GET",
     headers: { accept: "text/html" }

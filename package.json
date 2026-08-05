@@ -11,9 +11,10 @@
     "typegen": "wrangler types",
     "typecheck": "wrangler types && tsc --noEmit",
     "auth:setup": "tsx scripts/auth-setup.ts",
+    "test:auth": "tsx --test scripts/auth-setup.test-node.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm test",
+    "check": "npm run typecheck && npm test && npm run test:auth",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

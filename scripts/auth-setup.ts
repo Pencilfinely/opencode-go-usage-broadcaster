@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,14 +6,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { chromium, type BrowserContext } from "playwright-core";
 
-import {
-  parseSessionBundle,
-  type OpenCodeSessionBundleV1
-} from "../src/opencode-session";
+import { type OpenCodeSessionBundleV2 } from "../src/opencode-session";
 import { OpenCodeConsoleQuotaSource } from "../src/source";
+import { OpenCodeUsageListSource } from "../src/opencode-usage-source";
+import {
+  buildSessionBundle as buildV2SessionBundle,
+  deriveUsagePageNumberTemplate,
+  OPENCODE_ORIGIN,
+  waitForGoRequest,
+  waitForUsageListPage
+} from "./opencode-usage-capture";
 
 const AUTH_URL = "https://opencode.ai/auth";
-const OPENCODE_ORIGIN = "https://opencode.ai";
 const UPLOAD_SECRET_NAME = "OPENCODE_SESSION_BUNDLE";
 const UPLOAD_TIMEOUT_MS = 30_000;
 const WRANGLER_CLI = fileURLToPath(
@@ -38,6 +41,32 @@ export type UploadDependencies = {
     options: UploadSpawnOptions
   ) => UploadChild;
 };
+
+export type UploadMode = "deployed" | "version-only";
+
+export type UploadOptions = {
+  uploadMode?: UploadMode;
+  dependencies?: UploadDependencies;
+};
+
+export function parseAuthSetupArgs(
+  argv: readonly string[]
+): { uploadMode: UploadMode } {
+  if (argv.length === 0) return { uploadMode: "deployed" };
+  if (argv.length === 1 && argv[0] === "--version-only") {
+    return { uploadMode: "version-only" };
+  }
+  throw new Error("仅支持可选参数 --version-only");
+}
+
+export function buildWranglerSecretArgs(
+  wranglerCli: string,
+  mode: UploadMode
+): string[] {
+  return mode === "version-only"
+    ? [wranglerCli, "versions", "secret", "put", UPLOAD_SECRET_NAME]
+    : [wranglerCli, "secret", "put", UPLOAD_SECRET_NAME];
+}
 
 export function workspaceIdFromPageUrl(url: string): string | undefined {
   try {
@@ -97,30 +126,7 @@ export async function waitForWorkspaceId(
   }
 }
 
-export function buildSessionBundle(
-  workspaceId: string,
-  authCookie: string
-): OpenCodeSessionBundleV1 {
-  if (!/^wrk_[A-Za-z0-9]+$/u.test(workspaceId)) {
-    throw new Error("工作区 ID 无效");
-  }
-  const bundle = parseSessionBundle(JSON.stringify({
-    version: 1,
-    generation: randomUUID(),
-    createdAt: new Date().toISOString(),
-    workspaceId,
-    auth: { cookie: `auth=${authCookie}` },
-    request: {
-      url: `${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`,
-      method: "GET",
-      headers: { accept: "text/html" }
-    }
-  } satisfies OpenCodeSessionBundleV1));
-  if (bundle.version !== 1) {
-    throw new Error("生成的会话包版本无效");
-  }
-  return bundle;
-}
+export { buildV2SessionBundle as buildSessionBundle };
 
 type BrowserProfile = Pick<BrowserContext, "close">;
 type ProfileRemover = (directory: string) => Promise<void>;
@@ -137,7 +143,7 @@ export async function cleanUpBrowserProfile(
   }
 }
 
-async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessionBundleV1> {
+async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessionBundleV2> {
   const profileDirectory = await mkdtemp(join(tmpdir(), "opencode-auth-"));
   let context: BrowserContext | undefined;
   try {
@@ -152,15 +158,49 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
 
     const workspaceId = await waitForWorkspaceId(context, signal);
     signal.throwIfAborted();
-    await page.goto(`${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`);
+    const goRequestPromise = waitForGoRequest(page, workspaceId, signal);
+    await page.goto(`${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`, { signal });
+    const goRequest = await goRequestPromise;
     const authCookie = (await context.cookies(OPENCODE_ORIGIN)).find(
       (cookie) => cookie.name === "auth"
     );
     if (!authCookie) {
       throw new Error("已识别工作区，但未检测到 OpenCode auth Cookie");
     }
+    const page0Promise = waitForUsageListPage(page, signal);
+    await page.goto(`${OPENCODE_ORIGIN}/usage`, { signal });
+    const page0 = await page0Promise;
+    const usageList: OpenCodeSessionBundleV2["usageList"] = page0.records.length < 50
+      ? { firstPage: page0.request, pagination: { mode: "single-page" } }
+      : await (async () => {
+          const paginationButtons = page.locator(
+            '[data-slot="usage-table"] [data-slot="pagination"] > button'
+          );
+          if (await paginationButtons.count() !== 2) {
+            throw new Error("未找到唯一的 usage 分页控件");
+          }
+          const page1Promise = waitForUsageListPage(
+            page,
+            signal,
+            (candidate) => JSON.stringify(candidate.request) !== JSON.stringify(page0.request)
+          );
+          await paginationButtons.nth(1).click({ timeout: 10_000, signal });
+          const page1 = await page1Promise;
+          return {
+            firstPage: page0.request,
+            pagination: {
+              mode: "paginated" as const,
+              template: deriveUsagePageNumberTemplate(page0.request, page1.request)
+            }
+          };
+        })();
     signal.throwIfAborted();
-    return buildSessionBundle(workspaceId, authCookie.value);
+    const bundle = buildV2SessionBundle(workspaceId, authCookie.value, goRequest, usageList);
+    const replay = await new OpenCodeUsageListSource(bundle).fetch(Date.now());
+    if (replay.status === "unavailable") {
+      throw new Error("usage.list 回放验证未通过");
+    }
+    return bundle;
   } finally {
     await cleanUpBrowserProfile(context, profileDirectory);
   }
@@ -169,17 +209,26 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
 export async function uploadSessionBundle(
   sessionBundle: string,
   signal: AbortSignal,
-  dependencies: UploadDependencies = {
+  options: UploadDependencies | UploadOptions = {
     spawn: (command, args, options) =>
       spawn(command, args, options) as unknown as UploadChild
   }
 ): Promise<void> {
   if (signal.aborted) throw abortError(signal);
+  const dependencies: UploadDependencies = "spawn" in options
+    ? options
+    : options.dependencies ?? {
+        spawn: (command, args, spawnOptions) =>
+          spawn(command, args, spawnOptions) as unknown as UploadChild
+      };
+  const uploadMode: UploadMode = "spawn" in options
+    ? "deployed"
+    : options.uploadMode ?? "deployed";
   const command = process.execPath;
   await new Promise<void>((resolveUpload, rejectUpload) => {
     let child: UploadChild;
     try {
-      child = dependencies.spawn(command, [WRANGLER_CLI, "secret", "put", UPLOAD_SECRET_NAME], {
+      child = dependencies.spawn(command, buildWranglerSecretArgs(WRANGLER_CLI, uploadMode), {
         stdio: ["pipe", "ignore", "inherit"]
       });
     } catch {
@@ -248,6 +297,7 @@ async function main(): Promise<void> {
   const onSigint = () => controller.abort(new Error("授权已取消"));
   process.on("SIGINT", onSigint);
   try {
+    const { uploadMode } = parseAuthSetupArgs(process.argv.slice(2));
     const bundle = await collectSessionBundle(controller.signal);
     controller.signal.throwIfAborted();
     const snapshot = await new OpenCodeConsoleQuotaSource(bundle).fetch(new Date());
@@ -257,7 +307,7 @@ async function main(): Promise<void> {
       snapshot.windows.weekly.usedPercent,
       snapshot.windows.monthly.usedPercent
     ].map((percent) => `${percent}%`).join("\n"));
-    await uploadSessionBundle(JSON.stringify(bundle), controller.signal);
+    await uploadSessionBundle(JSON.stringify(bundle), controller.signal, { uploadMode });
   } finally {
     process.off("SIGINT", onSigint);
   }
