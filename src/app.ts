@@ -402,7 +402,8 @@ export async function runBroadcast(
           jobStatus: "skipped",
           errorKind: "stale-slot",
           states: [],
-          events: []
+          events: [],
+          usageChartSnapshots: []
         });
         return "completed";
       }
@@ -434,7 +435,8 @@ export async function runBroadcast(
           jobStatus: isScheduled ? "skipped" : "failed",
           errorKind: "auth-blocked",
           states: [{ key: "runtime", value: runtime, version: now }],
-          events
+          events,
+          usageChartSnapshots: []
         });
         return isScheduled ? "completed" : "failed";
       }
@@ -459,7 +461,8 @@ export async function runBroadcast(
             jobStatus: "skipped",
             errorKind,
             states: [{ key: "runtime", value: runtime, version: now }],
-            events
+            events,
+            usageChartSnapshots: []
           });
           return isScheduled ? "completed" : "failed";
         }
@@ -541,7 +544,8 @@ export async function runBroadcast(
           jobStatus: "failed",
           errorKind,
           states: [{ key: "runtime", value: runtime, version: now }],
-          events
+          events,
+          usageChartSnapshots: []
         });
         return isScheduled ? "completed" : "failed";
       }
@@ -556,7 +560,8 @@ export async function runBroadcast(
           jobStatus: "skipped",
           errorKind: "stale-slot",
           states: [{ key: "runtime", value: runtime, version: now }],
-          events: []
+          events: [],
+          usageChartSnapshots: []
         });
         return "completed";
       }
@@ -610,7 +615,8 @@ export async function runBroadcast(
           { key: "quota", value: evaluation.state, version: now },
           { key: "runtime", value: runtime, version: now }
         ],
-        events
+        events,
+        usageChartSnapshots: []
       });
       const report = await dispatchDue(
         repo,

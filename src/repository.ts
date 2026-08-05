@@ -42,6 +42,15 @@ export interface StateWrite {
   version: number;
 }
 
+export interface UsageChartSnapshotWrite {
+  id: string;
+  observedAt: number;
+  chartJson: string;
+  createdAt: number;
+}
+
+export interface UsageChartSnapshotRow extends UsageChartSnapshotWrite {}
+
 export interface SnapshotCommit {
   owner: string;
   now: number;
@@ -50,6 +59,7 @@ export interface SnapshotCommit {
   errorKind?: string;
   states: StateWrite[];
   events: NewOutboxEvent[];
+  usageChartSnapshots: UsageChartSnapshotWrite[];
 }
 
 export class LeaseLostError extends Error {
@@ -83,6 +93,13 @@ type CallbackRow = {
     | "dead"
     | "expired";
   attempt_count: number;
+};
+
+type UsageChartSnapshotDatabaseRow = {
+  id: string;
+  observed_at: number;
+  chart_json: string;
+  created_at: number;
 };
 
 export class Repository {
@@ -216,6 +233,16 @@ export class Repository {
       input.now,
       input.events
     ));
+    statements.push(...this.usageChartValidationStatements(
+      input.owner,
+      input.now,
+      input.usageChartSnapshots
+    ));
+    statements.push(...this.usageChartInsertStatements(
+      input.owner,
+      input.now,
+      input.usageChartSnapshots
+    ));
     statements.push(
       this.db
         .prepare(
@@ -247,6 +274,39 @@ export class Repository {
       )
       .bind(status, errorKind ?? null, jobKey)
       .run();
+  }
+
+  async loadUsageChartSnapshot(
+    id: string
+  ): Promise<UsageChartSnapshotRow | null> {
+    const row = await this.db
+      .prepare(
+        "SELECT id, observed_at, chart_json, created_at " +
+        "FROM usage_chart_snapshots WHERE id = ?"
+      )
+      .bind(id)
+      .first<UsageChartSnapshotDatabaseRow>();
+    if (!row) return null;
+    return {
+      id: row.id,
+      observedAt: row.observed_at,
+      chartJson: row.chart_json,
+      createdAt: row.created_at
+    };
+  }
+
+  async deleteExpiredUsageChartSnapshots(
+    cutoff: number,
+    limit = 200
+  ): Promise<number> {
+    const boundedLimit = Math.min(200, Math.max(0, Math.trunc(limit)));
+    if (boundedLimit === 0) return 0;
+    const result = await this.db.prepare(
+      "DELETE FROM usage_chart_snapshots WHERE id IN (" +
+      "SELECT id FROM usage_chart_snapshots WHERE created_at < ? " +
+      "ORDER BY created_at, id LIMIT ?)"
+    ).bind(cutoff, boundedLimit).run();
+    return result.meta.changes;
   }
 
   async claimDueEvent(
@@ -705,6 +765,55 @@ export class Repository {
       );
       return [insertEvent, ...triggerStatements];
     });
+  }
+
+  private usageChartValidationStatements(
+    owner: string,
+    now: number,
+    snapshots: UsageChartSnapshotWrite[]
+  ): D1PreparedStatement[] {
+    const guard =
+      "EXISTS (SELECT 1 FROM locks WHERE name = 'snapshot' " +
+      "AND owner = ? AND lease_until > ?)";
+    return snapshots.map((snapshot) => this.db.prepare(
+      "INSERT INTO usage_chart_snapshots " +
+      "(id, observed_at, chart_json, created_at) " +
+      "SELECT ?, ?, ?, ? WHERE NOT json_valid(?) AND " + guard + " " +
+      "AND EXISTS (SELECT 1 FROM outbox_events WHERE id = ?)"
+    ).bind(
+      snapshot.id,
+      snapshot.observedAt,
+      snapshot.chartJson,
+      snapshot.createdAt,
+      snapshot.chartJson,
+      owner,
+      now,
+      snapshot.id
+    ));
+  }
+
+  private usageChartInsertStatements(
+    owner: string,
+    now: number,
+    snapshots: UsageChartSnapshotWrite[]
+  ): D1PreparedStatement[] {
+    const guard =
+      "EXISTS (SELECT 1 FROM locks WHERE name = 'snapshot' " +
+      "AND owner = ? AND lease_until > ?)";
+    return snapshots.map((snapshot) => this.db.prepare(
+      "INSERT OR IGNORE INTO usage_chart_snapshots " +
+      "(id, observed_at, chart_json, created_at) " +
+      "SELECT ?, ?, ?, ? WHERE " + guard + " " +
+      "AND EXISTS (SELECT 1 FROM outbox_events WHERE id = ?)"
+    ).bind(
+      snapshot.id,
+      snapshot.observedAt,
+      snapshot.chartJson,
+      snapshot.createdAt,
+      owner,
+      now,
+      snapshot.id
+    ));
   }
 
   private callbackRow(eventId: string, shortCode: string): Promise<CallbackRow | null> {

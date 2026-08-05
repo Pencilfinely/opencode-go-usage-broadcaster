@@ -7,6 +7,7 @@ describe("D1 repository", () => {
     await env.DB.batch([
       env.DB.prepare("DELETE FROM event_triggers"),
       env.DB.prepare("DELETE FROM outbox_attempts"),
+      env.DB.prepare("DELETE FROM usage_chart_snapshots"),
       env.DB.prepare("DELETE FROM outbox_events"),
       env.DB.prepare("DELETE FROM runtime_state"),
       env.DB.prepare("DELETE FROM job_runs"),
@@ -460,6 +461,17 @@ describe("D1 repository", () => {
         content: "daily content",
         notAfter: now + 86_400_000,
         triggers: []
+      }],
+      usageChartSnapshots: [{
+        id: "event-commit",
+        observedAt: now + 1,
+        chartJson: JSON.stringify({
+          version: 1,
+          observedAt: now + 1,
+          truncated: false,
+          buckets: []
+        }),
+        createdAt: now + 1
       }]
     });
     expect(await repo.loadState<{ observation: string }>("quota")).toEqual({
@@ -483,6 +495,17 @@ describe("D1 repository", () => {
         "SELECT status FROM job_runs WHERE job_key = 'daily:commit'"
       ).first()
     ).toEqual({ status: "succeeded" });
+    expect(await repo.loadUsageChartSnapshot("event-commit")).toEqual({
+      id: "event-commit",
+      observedAt: now + 1,
+      chartJson: JSON.stringify({
+        version: 1,
+        observedAt: now + 1,
+        truncated: false,
+        buckets: []
+      }),
+      createdAt: now + 1
+    });
 
     await repo.markJob("daily:commit", "failed", "late-worker");
     expect(
@@ -541,6 +564,17 @@ describe("D1 repository", () => {
           usedPercent: 100,
           resetAt: "2026-09-01T00:00:00Z"
         }]
+      }],
+      usageChartSnapshots: [{
+        id: "event-lost-commit",
+        observedAt: now + 2,
+        chartJson: JSON.stringify({
+          version: 1,
+          observedAt: now + 2,
+          truncated: false,
+          buckets: []
+        }),
+        createdAt: now + 2
       }]
     })).rejects.toBeInstanceOf(LeaseLostError);
     expect(await repo.loadState("lost-state")).toBeNull();
@@ -554,6 +588,79 @@ describe("D1 repository", () => {
         "SELECT status FROM job_runs WHERE job_key = 'daily:lost-commit'"
       ).first()
     ).toEqual({ status: "started" });
+    expect(await repo.loadUsageChartSnapshot("event-lost-commit")).toBeNull();
+  });
+
+  it("图表快照不合法时回滚受租约保护的整批写入", async () => {
+    const repo = new Repository(env.DB);
+    const now = Date.parse("2026-08-05T03:00:00Z");
+    expect(await repo.acquireSnapshotLease("rollback-owner", now, 90_000)).toBe(true);
+    expect(await repo.tryStartJob({
+      key: "daily:chart-rollback",
+      kind: "daily",
+      scheduledAt: now,
+      startedAt: now
+    })).toBe(true);
+
+    await expect(repo.commitSnapshotUnderLease({
+      owner: "rollback-owner",
+      now: now + 1,
+      jobKey: "daily:chart-rollback",
+      jobStatus: "succeeded",
+      states: [{ key: "chart-rollback-state", value: { saved: false }, version: 1 }],
+      events: [{
+        id: "event-chart-rollback",
+        logicalKey: "daily:chart-rollback",
+        kind: "daily",
+        title: "图表回滚",
+        content: "图表回滚内容",
+        notAfter: now + 86_400_000,
+        triggers: []
+      }],
+      usageChartSnapshots: [{
+        id: "event-chart-rollback",
+        observedAt: now + 1,
+        chartJson: "not-json",
+        createdAt: now + 1
+      }]
+    })).rejects.toThrow();
+
+    expect(await repo.loadState("chart-rollback-state")).toBeNull();
+    expect(await env.DB.prepare(
+      "SELECT id FROM outbox_events WHERE id = ?"
+    ).bind("event-chart-rollback").first()).toBeNull();
+    expect(await repo.loadUsageChartSnapshot("event-chart-rollback")).toBeNull();
+    expect(await env.DB.prepare(
+      "SELECT status FROM job_runs WHERE job_key = ?"
+    ).bind("daily:chart-rollback").first()).toEqual({ status: "started" });
+  });
+
+  it("每次最多按稳定顺序清理二百条过期图表快照", async () => {
+    const repo = new Repository(env.DB);
+    const cutoff = Date.parse("2026-08-05T00:00:00Z");
+    const createdAt = cutoff - 1;
+    const statements: D1PreparedStatement[] = [];
+    for (let index = 0; index <= 200; index += 1) {
+      const id = `chart-expired-${String(index).padStart(3, "0")}`;
+      statements.push(env.DB.prepare(
+        "INSERT INTO outbox_events " +
+        "(id, logical_key, kind, title, content, status, next_attempt_at, " +
+        "not_after, created_at, updated_at) VALUES (?, ?, 'daily', ?, ?, " +
+        "'succeeded', ?, ?, ?, ?)"
+      ).bind(id, `daily:${id}`, id, id, createdAt, cutoff, createdAt, createdAt));
+      statements.push(env.DB.prepare(
+        "INSERT INTO usage_chart_snapshots " +
+        "(id, observed_at, chart_json, created_at) VALUES (?, ?, ?, ?)"
+      ).bind(id, createdAt, "{}", createdAt));
+    }
+    await env.DB.batch(statements);
+
+    expect(await repo.deleteExpiredUsageChartSnapshots(cutoff)).toBe(200);
+    expect(await env.DB.prepare(
+      "SELECT id FROM usage_chart_snapshots ORDER BY created_at, id"
+    ).all()).toMatchObject({ results: [{ id: "chart-expired-200" }] });
+    expect(await repo.deleteExpiredUsageChartSnapshots(cutoff, 0)).toBe(0);
+    expect(await repo.deleteExpiredUsageChartSnapshots(cutoff, 999)).toBe(1);
   });
 
   it("旧接口接受响应不能终结已被新租约领取的尝试", async () => {

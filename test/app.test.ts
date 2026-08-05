@@ -47,6 +47,7 @@ describe("定时广播编排", () => {
     await env.DB.batch([
       env.DB.prepare("DELETE FROM event_triggers"),
       env.DB.prepare("DELETE FROM outbox_attempts"),
+      env.DB.prepare("DELETE FROM usage_chart_snapshots"),
       env.DB.prepare("DELETE FROM outbox_events"),
       env.DB.prepare("DELETE FROM runtime_state"),
       env.DB.prepare("DELETE FROM job_runs"),
