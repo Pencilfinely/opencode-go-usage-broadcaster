@@ -163,6 +163,7 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
 
     const workspaceId = await waitForWorkspaceId(context, signal);
     signal.throwIfAborted();
+    console.log("授权阶段：已识别工作区，开始捕获 go");
     const goRequest = await waitBeforeTrigger(
       signal,
       (waiterSignal) => waitForGoRequest(page, workspaceId, waiterSignal),
@@ -177,15 +178,18 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
     if (!authCookie) {
       throw new Error("已识别工作区，但未检测到 OpenCode auth Cookie");
     }
+    console.log("授权阶段：go 已捕获，开始捕获 usage 第 0 页");
     const page0 = await waitBeforeTrigger(
       signal,
       (waiterSignal) => waitForUsageListPage(page, waiterSignal),
       (triggerSignal) => page.goto(workspaceUsageUrl(workspaceId), { signal: triggerSignal })
         .then(() => undefined)
     );
+    console.log("授权阶段：usage 第 0 页已捕获");
     const usageList: OpenCodeSessionBundleV2["usageList"] = page0.records.length < 50
       ? { firstPage: page0.request, pagination: { mode: "single-page" } }
       : await (async () => {
+          console.log("授权阶段：开始捕获 usage 第 1 页");
           const paginationButtons = page.locator(
             '[data-slot="usage-table"] [data-slot="pagination"] > button'
           );
@@ -204,6 +208,7 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
               signal: triggerSignal
             })
           );
+          console.log("授权阶段：usage 第 1 页已捕获");
           return {
             firstPage: page0.request,
             pagination: {
@@ -214,6 +219,7 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
         })();
     signal.throwIfAborted();
     const bundle = buildV2SessionBundle(workspaceId, authCookie.value, goRequest, usageList);
+    console.log("授权阶段：会话包已生成，开始真实回放");
     const replay = await new OpenCodeUsageListSource(bundle).fetch(Date.now());
     if (replay.status === "unavailable") {
       throw new Error("usage.list 回放验证未通过");
@@ -325,7 +331,9 @@ async function main(): Promise<void> {
       snapshot.windows.weekly.usedPercent,
       snapshot.windows.monthly.usedPercent
     ].map((percent) => `${percent}%`).join("\n"));
+    console.log("授权阶段：真实回放通过，开始上传");
     await uploadSessionBundle(JSON.stringify(bundle), controller.signal, { uploadMode });
+    console.log("授权阶段：上传完成");
   } finally {
     process.off("SIGINT", onSigint);
   }
