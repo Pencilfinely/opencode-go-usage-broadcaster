@@ -405,6 +405,123 @@ test("为工作区生成官方 usage 页面地址", async () => {
   );
 });
 
+test("通过同源 SPA 锚点导航 usage 页面且不使用完整文档跳转", async () => {
+  const module = await import("./auth-setup");
+  const navigateWithinOpenCodeApp = (module as Record<string, unknown>)
+    .navigateWithinOpenCodeApp as ((
+      page: unknown,
+      targetUrl: string,
+      signal: AbortSignal
+    ) => Promise<void>) | undefined;
+  if (!navigateWithinOpenCodeApp) throw new Error("缺少 SPA 导航辅助函数");
+
+  const actions: string[] = [];
+  let createdTag = "";
+  let anchorHref = "";
+  const anchor = {
+    hidden: false,
+    set href(value: string) { anchorHref = value; },
+    click() { actions.push("点击"); },
+    remove() { actions.push("移除"); }
+  };
+  const fakeDocument = {
+    createElement(tag: string) {
+      createdTag = tag;
+      return anchor;
+    },
+    body: {
+      append(element: unknown) {
+        assert.equal(element, anchor);
+        actions.push("追加");
+      }
+    }
+  };
+  let gotoCalls = 0;
+  const fakePage = {
+    async evaluate(callback: (href: string) => void, href: string) {
+      const globals = globalThis as { document?: unknown };
+      const originalDocument = globals.document;
+      globals.document = fakeDocument;
+      try {
+        callback(href);
+      } finally {
+        globals.document = originalDocument;
+      }
+    },
+    async goto() {
+      gotoCalls += 1;
+      throw new Error("usage 导航不得调用 goto");
+    }
+  };
+
+  await navigateWithinOpenCodeApp(
+    fakePage,
+    "https://opencode.ai/workspace/wrk_Target9/usage",
+    new AbortController().signal
+  );
+
+  assert.equal(createdTag, "a");
+  assert.equal(anchorHref, "https://opencode.ai/workspace/wrk_Target9/usage");
+  assert.equal(anchor.hidden, true);
+  assert.deepEqual(actions, ["追加", "点击", "移除"]);
+  assert.equal(gotoCalls, 0);
+});
+
+test("在执行页面代码前拒绝无效或非 usage 的 SPA 导航目标", async () => {
+  const module = await import("./auth-setup");
+  const navigateWithinOpenCodeApp = (module as Record<string, unknown>)
+    .navigateWithinOpenCodeApp as ((
+      page: unknown,
+      targetUrl: string,
+      signal: AbortSignal
+    ) => Promise<void>) | undefined;
+  if (!navigateWithinOpenCodeApp) throw new Error("缺少 SPA 导航辅助函数");
+
+  let evaluateCalls = 0;
+  const fakePage = {
+    async evaluate() { evaluateCalls += 1; }
+  };
+
+  for (const targetUrl of [
+    "not a URL",
+    "https://evil.example/workspace/wrk_Target9/usage",
+    "https://opencode.ai/workspace/wrk_Target9/go",
+    "https://opencode.ai/workspace/wrk_Target9/usage?from=test",
+    "https://opencode.ai/workspace/wrk_Target9/usage#details"
+  ]) {
+    await assert.rejects(
+      navigateWithinOpenCodeApp(fakePage, targetUrl, new AbortController().signal),
+      /SPA 导航目标/u
+    );
+  }
+  assert.equal(evaluateCalls, 0);
+});
+
+test("SPA 导航预先取消时不执行页面代码", async () => {
+  const module = await import("./auth-setup");
+  const navigateWithinOpenCodeApp = (module as Record<string, unknown>)
+    .navigateWithinOpenCodeApp as ((
+      page: unknown,
+      targetUrl: string,
+      signal: AbortSignal
+    ) => Promise<void>) | undefined;
+  if (!navigateWithinOpenCodeApp) throw new Error("缺少 SPA 导航辅助函数");
+
+  const controller = new AbortController();
+  controller.abort(new Error("用户取消 SPA 导航"));
+  let evaluateCalls = 0;
+
+  await assert.rejects(
+    navigateWithinOpenCodeApp(
+      { async evaluate() { evaluateCalls += 1; } },
+      "https://opencode.ai/workspace/wrk_Target9/usage",
+      controller.signal
+    ),
+    /用户取消 SPA 导航/u
+  );
+  assert.equal(evaluateCalls, 0);
+});
+
 test("轮询当前及上下文页面直到识别目标工作区", async () => {
   const module = await import("./auth-setup");
   const waitForWorkspaceId = (module as Record<string, unknown>)

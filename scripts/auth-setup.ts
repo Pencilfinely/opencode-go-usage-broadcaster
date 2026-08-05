@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { chromium, type BrowserContext } from "playwright-core";
+import { chromium, type BrowserContext, type Page } from "playwright-core";
 
 import { type OpenCodeSessionBundleV2 } from "../src/opencode-session";
 import { OpenCodeConsoleQuotaSource } from "../src/source";
 import { OpenCodeUsageListSource } from "../src/opencode-usage-source";
 import {
   buildSessionBundle as buildV2SessionBundle,
-  deriveUsagePageNumberTemplate,
+  buildUsageGetAuthorization,
   OPENCODE_ORIGIN,
   waitBeforeTrigger,
   waitForGoRequest,
@@ -82,6 +82,55 @@ export function workspaceIdFromPageUrl(url: string): string | undefined {
 
 export function workspaceUsageUrl(workspaceId: string): string {
   return `${OPENCODE_ORIGIN}/workspace/${encodeURIComponent(workspaceId)}/usage`;
+}
+
+export async function navigateWithinOpenCodeApp(
+  page: Pick<Page, "evaluate">,
+  targetUrl: string,
+  signal: AbortSignal
+): Promise<void> {
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    throw new Error("SPA 导航目标 URL 无效");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "opencode.ai" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    !/^\/workspace\/wrk_[A-Za-z0-9]+\/usage$/u.test(parsed.pathname)
+  ) {
+    throw new Error("SPA 导航目标必须是同源的精确 usage 路径");
+  }
+  signal.throwIfAborted();
+  await page.evaluate((href) => {
+    const browserDocument = (globalThis as unknown as {
+      document: {
+        createElement(tag: "a"): {
+          href: string;
+          hidden: boolean;
+          click(): void;
+          remove(): void;
+        };
+        body: { append(node: unknown): void };
+      };
+    }).document;
+    const anchor = browserDocument.createElement("a");
+    anchor.href = href;
+    anchor.hidden = true;
+    browserDocument.body.append(anchor);
+    try {
+      anchor.click();
+    } finally {
+      anchor.remove();
+    }
+  }, parsed.href);
+  signal.throwIfAborted();
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -181,42 +230,19 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
     console.log("授权阶段：go 已捕获，开始捕获 usage 第 0 页");
     const page0 = await waitBeforeTrigger(
       signal,
-      (waiterSignal) => waitForUsageListPage(page, waiterSignal),
-      (triggerSignal) => page.goto(workspaceUsageUrl(workspaceId), { signal: triggerSignal })
-        .then(() => undefined)
+      (waiterSignal) => waitForUsageListPage(page, workspaceId, 0, waiterSignal),
+      (triggerSignal) => navigateWithinOpenCodeApp(
+        page,
+        workspaceUsageUrl(workspaceId),
+        triggerSignal
+      )
     );
     console.log("授权阶段：usage 第 0 页已捕获");
-    const usageList: OpenCodeSessionBundleV2["usageList"] = page0.records.length < 50
-      ? { firstPage: page0.request, pagination: { mode: "single-page" } }
-      : await (async () => {
-          console.log("授权阶段：开始捕获 usage 第 1 页");
-          const paginationButtons = page.locator(
-            '[data-slot="usage-table"] [data-slot="pagination"] > button'
-          );
-          if (await paginationButtons.count() !== 2) {
-            throw new Error("未找到唯一的 usage 分页控件");
-          }
-          const page1 = await waitBeforeTrigger(
-            signal,
-            (waiterSignal) => waitForUsageListPage(
-              page,
-              waiterSignal,
-              (candidate) => JSON.stringify(candidate.request) !== JSON.stringify(page0.request)
-            ),
-            (triggerSignal) => paginationButtons.nth(1).click({
-              timeout: 10_000,
-              signal: triggerSignal
-            })
-          );
-          console.log("授权阶段：usage 第 1 页已捕获");
-          return {
-            firstPage: page0.request,
-            pagination: {
-              mode: "paginated" as const,
-              template: deriveUsagePageNumberTemplate(page0.request, page1.request)
-            }
-          };
-        })();
+    const usageList = buildUsageGetAuthorization(
+      page0.request,
+      workspaceId,
+      page0.records.length
+    );
     signal.throwIfAborted();
     const bundle = buildV2SessionBundle(workspaceId, authCookie.value, goRequest, usageList);
     console.log("授权阶段：会话包已生成，开始真实回放");
