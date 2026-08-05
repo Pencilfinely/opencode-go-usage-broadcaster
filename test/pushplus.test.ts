@@ -294,7 +294,7 @@ describe("PushPlus dispatch", () => {
       })
     );
 
-    await dispatchDue(
+    const report = await dispatchDue(
       repo as unknown as Repository,
       {
         token: "pushplus-token",
@@ -339,6 +339,10 @@ describe("PushPlus dispatch", () => {
       now
     );
     expect(repo.markAttemptFailure).not.toHaveBeenCalled();
+    expect(report).toEqual({
+      acceptedEventIds: [event.id],
+      failedEventIds: []
+    });
   });
 
   it("records a bounded retry transition when PushPlus rejects a request", async () => {
@@ -349,7 +353,7 @@ describe("PushPlus dispatch", () => {
       _init?: RequestInit
     ) => new Response("denied", { status: 503 }));
 
-    await dispatchDue(
+    const report = await dispatchDue(
       repo as unknown as Repository,
       {
         token: "pushplus-token",
@@ -369,6 +373,40 @@ describe("PushPlus dispatch", () => {
       now + 30 * 60 * 1000
     );
     expect(repo.markAttemptAccepted).not.toHaveBeenCalled();
+    expect(report).toEqual({
+      acceptedEventIds: [],
+      failedEventIds: [event.id]
+    });
+  });
+
+  it("网络失败时报告目标事件首次投递失败", async () => {
+    const event = claimedEvent();
+    const repo = dispatchRepository([event]);
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("网络不可用"));
+
+    const report = await dispatchDue(
+      repo as unknown as Repository,
+      {
+        token: "pushplus-token",
+        topic: "pushplus-topic",
+        callbackSecret: secret,
+        callbackBaseUrl: "https://worker.test"
+      },
+      () => now,
+      fetchImpl
+    );
+
+    expect(repo.markAttemptFailure).toHaveBeenCalledWith(
+      event.id,
+      event.attemptCount,
+      expect.any(String),
+      now,
+      now + 30 * 60 * 1000
+    );
+    expect(report).toEqual({
+      acceptedEventIds: [],
+      failedEventIds: [event.id]
+    });
   });
 
   it.each([

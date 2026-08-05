@@ -160,6 +160,360 @@ describe("定时广播编排", () => {
     expect(sourceFetch).toHaveBeenCalledTimes(1);
   });
 
+  it("手动采集失败时返回失败且不创建用量事件", async () => {
+    const occurredAt = Date.parse("2026-08-05T16:30:00Z");
+    const sourceFetch = vi.fn().mockRejectedValue(
+      new SourceError("transient", "上游暂时不可用")
+    );
+
+    const result = await runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "collector-failure"
+      },
+      testEnv(),
+      {
+        source: { fetch: sourceFetch },
+        fetchImpl: vi.fn(),
+        sleep: vi.fn().mockResolvedValue(undefined),
+        now: () => occurredAt
+      }
+    );
+
+    expect(result).toBe("failed");
+    expect(sourceFetch).toHaveBeenCalledTimes(3);
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events WHERE kind = 'daily'"
+    ).first()).toEqual({ count: 0 });
+  });
+
+  it.each([
+    ["PushPlus 拒绝", () => Promise.resolve(
+      Response.json({ code: 500, data: "" })
+    )],
+    ["PushPlus 网络失败", () => Promise.reject(new Error("网络不可用"))]
+  ])("手动首次投递遇到%s时返回失败", async (_caseName, send) => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const result = await runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "push-failure-" + _caseName
+      },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+        fetchImpl: vi.fn(send),
+        now: () => occurredAt
+      }
+    );
+
+    expect(result).toBe("failed");
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_events WHERE logical_key = ?"
+    ).bind("broadcast:manual:push-failure-" + _caseName).first()).toEqual({
+      status: "retryable"
+    });
+  });
+
+  it("更早事件耗尽单次投递上限时不把未轮到的手动目标视为成功", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const sourceFetch = vi.fn(async () => {
+      await env.DB.batch(Array.from({ length: 5 }, (_unused, index) =>
+        env.DB.prepare(
+          "INSERT INTO outbox_events " +
+          "(id, logical_key, kind, title, content, status, next_attempt_at, " +
+          "not_after, created_at, updated_at) " +
+          "VALUES (?, ?, 'daily', '较早事件', '较早事件', 'pending', ?, ?, ?, ?)"
+        ).bind(
+          "earlier-" + index,
+          "earlier:" + index,
+          occurredAt,
+          occurredAt + 30 * 60 * 1000,
+          occurredAt - 1,
+          occurredAt - 1
+        )
+      ));
+      return snapshot(20, occurredAt);
+    });
+    const pushFetch = vi.fn().mockResolvedValue(
+      new Response("拒绝", { status: 503 })
+    );
+
+    const result = await runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "not-reached"
+      },
+      testEnv(),
+      {
+        source: { fetch: sourceFetch },
+        fetchImpl: pushFetch,
+        now: () => occurredAt
+      }
+    );
+
+    expect(result).toBe("failed");
+    expect(pushFetch).toHaveBeenCalledTimes(5);
+    expect(await env.DB.prepare(
+      "SELECT status FROM outbox_events WHERE logical_key = ?"
+    ).bind("broadcast:manual:not-reached").first()).toEqual({
+      status: "pending"
+    });
+  });
+
+  it("手动任务持有快照租约时定时整点等待释放后仍完成广播", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    const manualAt = scheduledAt + 100;
+    let announceSourceStarted!: () => void;
+    const sourceStarted = new Promise<void>((resolve) => {
+      announceSourceStarted = resolve;
+    });
+    let releaseManualSource!: (value: QuotaSnapshot) => void;
+    const manualSourceFetch = vi.fn(() => {
+      announceSourceStarted();
+      return new Promise<QuotaSnapshot>((resolve) => {
+        releaseManualSource = resolve;
+      });
+    });
+    const pushFetch = vi.fn().mockImplementation(() => Promise.resolve(
+      Response.json({ code: 200, data: "provider-id" })
+    ));
+    const manualPromise = runBroadcast(
+      {
+        type: "manual",
+        occurredAt: manualAt,
+        idempotencyDigest: "lease-holder"
+      },
+      testEnv(),
+      {
+        source: { fetch: manualSourceFetch },
+        fetchImpl: pushFetch,
+        now: () => manualAt
+      }
+    );
+    await sourceStarted;
+
+    let scheduledNow = scheduledAt;
+    let manualReleased = false;
+    const sleep = vi.fn(async () => {
+      scheduledNow += 1000;
+      if (!manualReleased) {
+        manualReleased = true;
+        releaseManualSource(snapshot(20, manualAt));
+        await manualPromise;
+      }
+    });
+    const scheduledResult = await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: {
+          fetch: vi.fn().mockResolvedValue(snapshot(21, scheduledAt + 1000))
+        },
+        fetchImpl: pushFetch,
+        sleep,
+        now: () => scheduledNow
+      }
+    );
+    if (!manualReleased) {
+      releaseManualSource(snapshot(20, manualAt));
+      await manualPromise;
+    }
+
+    expect(scheduledResult).toBe("completed");
+    expect(sleep).toHaveBeenCalled();
+    const events = await env.DB.prepare(
+      "SELECT logical_key, status FROM outbox_events ORDER BY logical_key"
+    ).all<{ logical_key: string; status: string }>();
+    expect(events.results).toEqual([
+      { logical_key: "broadcast:manual:lease-holder", status: "succeeded" },
+      { logical_key: "broadcast:scheduled:2026-08-05:09", status: "succeeded" }
+    ]);
+  });
+
+  it("定时租约重试到槽位边界即停止且不采集或创建旧事件", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    const slotEnd = Date.parse("2026-08-05T02:00:00Z");
+    await env.DB.prepare(
+      "UPDATE locks SET owner = 'manual-owner', lease_until = ? " +
+      "WHERE name = 'snapshot'"
+    ).bind(slotEnd + 1).run();
+    let current = scheduledAt;
+    const sourceFetch = vi.fn();
+    const sleep = vi.fn(async () => {
+      current = slotEnd;
+    });
+
+    const result = await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: sourceFetch },
+        fetchImpl: vi.fn(),
+        sleep,
+        now: () => current
+      }
+    );
+
+    expect(result).toBe("busy");
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(sourceFetch).not.toHaveBeenCalled();
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events"
+    ).first()).toEqual({ count: 0 });
+  });
+
+  it("跨小时延迟的旧 Cron 槽位不补发且当前槽位仍可独立广播", async () => {
+    const oldSlot = Date.parse("2026-08-05T01:00:00Z");
+    const currentSlot = Date.parse("2026-08-05T02:00:00Z");
+    const delayedNow = currentSlot + 60 * 1000;
+    const oldSourceFetch = vi.fn().mockResolvedValue(snapshot(20, delayedNow));
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(oldSlot),
+        cron: "0 1-15 * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      { source: { fetch: oldSourceFetch }, fetchImpl: pushFetch, now: () => delayedNow }
+    );
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(currentSlot),
+        cron: "0 1-15 * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(21, delayedNow)) },
+        fetchImpl: pushFetch,
+        now: () => delayedNow
+      }
+    );
+
+    expect(oldSourceFetch).not.toHaveBeenCalled();
+    const events = await env.DB.prepare(
+      "SELECT logical_key, not_after FROM outbox_events"
+    ).all<{ logical_key: string; not_after: number }>();
+    expect(events.results).toEqual([{
+      logical_key: "broadcast:scheduled:2026-08-05:10",
+      not_after: Date.parse("2026-08-05T03:00:00Z")
+    }]);
+  });
+
+  it("夜间手动认证失败不发故障通知并由下一定时任务创建警告", async () => {
+    const manualAt = Date.parse("2026-08-05T16:30:00Z");
+    const scheduledAt = Date.parse("2026-08-06T01:00:00Z");
+    const sourceFetch = vi.fn().mockRejectedValue(
+      new SourceError("auth", "会话失效")
+    );
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    expect(await runBroadcast(
+      {
+        type: "manual",
+        occurredAt: manualAt,
+        idempotencyDigest: "night-auth-failure"
+      },
+      testEnv(),
+      { source: { fetch: sourceFetch }, fetchImpl: pushFetch, now: () => manualAt }
+    )).toBe("failed");
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events"
+    ).first()).toEqual({ count: 0 });
+    const runtimeBeforeScheduled = await env.DB.prepare(
+      "SELECT value_json FROM runtime_state WHERE key = 'runtime'"
+    ).first<{ value_json: string }>();
+    expect(JSON.parse(runtimeBeforeScheduled!.value_json).faults.auth)
+      .toMatchObject({ warningCreated: false });
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(scheduledAt),
+        cron: "0 1-15 * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      { source: { fetch: sourceFetch }, fetchImpl: pushFetch, now: () => scheduledAt }
+    );
+
+    expect(sourceFetch).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(
+      "SELECT kind, status FROM outbox_events"
+    ).first()).toEqual({ kind: "fault", status: "succeeded" });
+  });
+
+  it("手动恢复只发送目标用量并把恢复通知留给下一定时任务", async () => {
+    const at0900 = Date.parse("2026-08-05T01:00:00Z");
+    const manualAt = Date.parse("2026-08-05T01:30:00Z");
+    const at1000 = Date.parse("2026-08-05T02:00:00Z");
+    const pushFetch = vi.fn().mockImplementation(() => Promise.resolve(
+      Response.json({ code: 200, data: "provider-id" })
+    ));
+    const generationOne = testEnv();
+    const generationTwo = {
+      ...testEnv(),
+      OPENCODE_AUTH_GENERATION: "generation-2"
+    } as unknown as Cloudflare.Env;
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(at0900),
+        cron: "0 1-15 * * *"
+      }),
+      generationOne,
+      createExecutionContext(),
+      {
+        source: { fetch: vi.fn().mockRejectedValue(new SourceError("auth", "失效")) },
+        fetchImpl: pushFetch,
+        now: () => at0900
+      }
+    );
+    expect(await runBroadcast(
+      {
+        type: "manual",
+        occurredAt: manualAt,
+        idempotencyDigest: "manual-recovery"
+      },
+      generationTwo,
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, manualAt)) },
+        fetchImpl: pushFetch,
+        now: () => manualAt
+      }
+    )).toBe("completed");
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events WHERE kind = 'recovery'"
+    ).first()).toEqual({ count: 0 });
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(at1000),
+        cron: "0 1-15 * * *"
+      }),
+      generationTwo,
+      createExecutionContext(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(21, at1000)) },
+        fetchImpl: pushFetch,
+        now: () => at1000
+      }
+    );
+
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events WHERE kind = 'recovery'"
+    ).first()).toEqual({ count: 1 });
+  });
+
   it("手动广播先执行时不取消延迟到达的定时整点", async () => {
     const scheduledAt = Date.parse("2026-08-05T02:00:00Z");
     const manualAt = Date.parse("2026-08-05T02:30:00Z");

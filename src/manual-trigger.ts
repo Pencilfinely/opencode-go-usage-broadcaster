@@ -1,7 +1,6 @@
-import type { BroadcastTrigger } from "./app";
+import type { BroadcastResult, BroadcastTrigger } from "./app";
 import type { AppConfig } from "./config";
 
-type BroadcastResult = "completed" | "duplicate" | "busy";
 type BroadcastRunner = (trigger: BroadcastTrigger) => Promise<BroadcastResult>;
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{16,128}$/u;
@@ -63,13 +62,21 @@ export async function handleManualTrigger(
     return new Response("请求无效", { status: 400 });
   }
 
-  const result = await run({
-    type: "manual",
-    occurredAt: clock(),
-    idempotencyDigest: await sha256Hex(idempotencyKey)
-  });
+  let result: BroadcastResult;
+  try {
+    result = await run({
+      type: "manual",
+      occurredAt: clock(),
+      idempotencyDigest: await sha256Hex(idempotencyKey)
+    });
+  } catch {
+    return new Response("上游服务失败", { status: 502 });
+  }
   if (result === "busy") {
     return new Response("服务繁忙", { status: 503 });
+  }
+  if (result === "failed") {
+    return new Response("上游服务失败", { status: 502 });
   }
   return new Response(null, { status: 204 });
 }

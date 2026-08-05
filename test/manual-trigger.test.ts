@@ -117,4 +117,28 @@ describe("安全手动广播入口", () => {
     expect(body).not.toContain(SECRET);
     expect(body).not.toContain(IDEMPOTENCY_KEY);
   });
+
+  it("广播采集或首次投递失败时返回通用上游错误", async () => {
+    const run = vi.fn<(trigger: BroadcastTrigger) => Promise<"failed">>()
+      .mockResolvedValue("failed");
+
+    const response = await handleManualTrigger(request(), config, run);
+
+    expect(response.status).toBe(502);
+    const body = await response.text();
+    expect(body).toMatch(/[\u4e00-\u9fff]/u);
+    expect(body).not.toContain(SECRET);
+    expect(body).not.toContain(IDEMPOTENCY_KEY);
+  });
+
+  it("广播内部异常时返回不泄露细节的通用错误", async () => {
+    const sensitiveDetail = "上游响应含敏感会话";
+    const run = vi.fn<(trigger: BroadcastTrigger) => Promise<"completed">>()
+      .mockRejectedValue(new Error(sensitiveDetail));
+
+    const response = await handleManualTrigger(request(), config, run);
+
+    expect(response.status).toBe(502);
+    expect(await response.text()).not.toContain(sensitiveDetail);
+  });
 });

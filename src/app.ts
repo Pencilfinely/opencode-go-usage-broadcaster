@@ -53,6 +53,8 @@ export type BroadcastTrigger =
   | { type: "scheduled"; occurredAt: number }
   | { type: "manual"; occurredAt: number; idempotencyDigest: string };
 
+export type BroadcastResult = "completed" | "duplicate" | "busy" | "failed";
+
 const EMPTY_RUNTIME: RuntimeState = {
   version: 0,
   startupCreated: false,
@@ -63,6 +65,9 @@ const EMPTY_RUNTIME: RuntimeState = {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REGULAR_SLOT_MS = 60 * 60 * 1000;
 const SNAPSHOT_LEASE_MS = 120 * 1000;
+const SNAPSHOT_LEASE_RETRY_MS = 1000;
+const SNAPSHOT_LEASE_MAX_RETRIES =
+  SNAPSHOT_LEASE_MS / SNAPSHOT_LEASE_RETRY_MS;
 const FAULT_KINDS = ["auth", "transient", "schema"] as const;
 
 const FAULT_COPY: Record<
@@ -294,20 +299,52 @@ export async function runScheduled(
   await runBroadcast({ type: "scheduled", occurredAt: scheduledAt }, env, deps);
 }
 
+async function acquireBroadcastLease(
+  repo: Repository,
+  owner: string,
+  trigger: BroadcastTrigger,
+  clock: () => number,
+  sleep: (milliseconds: number) => Promise<void>
+): Promise<boolean> {
+  const slotEnd = trigger.type === "scheduled"
+    ? nextShanghaiHour(trigger.occurredAt)
+    : undefined;
+  for (let retries = 0; ; retries += 1) {
+    const attemptNow = clock();
+    if (slotEnd !== undefined && attemptNow >= slotEnd) return false;
+    if (await repo.acquireSnapshotLease(
+      owner,
+      attemptNow,
+      SNAPSHOT_LEASE_MS
+    )) {
+      return true;
+    }
+    if (
+      trigger.type === "manual" ||
+      retries >= SNAPSHOT_LEASE_MAX_RETRIES
+    ) {
+      return false;
+    }
+    await sleep(Math.min(SNAPSHOT_LEASE_RETRY_MS, slotEnd! - attemptNow));
+  }
+}
+
 export async function runBroadcast(
   trigger: BroadcastTrigger,
   env: Cloudflare.Env,
   deps: AppDeps = {}
-): Promise<"completed" | "duplicate" | "busy"> {
+): Promise<BroadcastResult> {
   const config = loadConfig(env);
   const repo = new Repository(env.DB);
   const clock = deps.now ?? Date.now;
-  const now = clock();
   const scheduledAt = trigger.occurredAt;
   const isScheduled = trigger.type === "scheduled";
   if (!Number.isFinite(scheduledAt)) {
     throw new Error("occurredAt must be finite");
   }
+  const scheduledNotAfter = isScheduled
+    ? nextShanghaiHour(scheduledAt)
+    : undefined;
   const source = deps.source ?? createQuotaSource(
     config,
     deps.sourceFetchImpl ?? fetch
@@ -315,18 +352,25 @@ export async function runBroadcast(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? defaultSleep;
 
+  if (scheduledNotAfter !== undefined && clock() >= scheduledNotAfter) {
+    return "completed";
+  }
   await dispatchDue(repo, config.pushplus, clock, fetchImpl);
+  let dispatchedAfterCommit = false;
   try {
     const owner = crypto.randomUUID();
-    const acquired = await repo.acquireSnapshotLease(
+    const acquired = await acquireBroadcastLease(
+      repo,
       owner,
-      now,
-      SNAPSHOT_LEASE_MS
+      trigger,
+      clock,
+      sleep
     );
     if (!acquired) return "busy";
 
     let startedJobKey: string | undefined;
     try {
+      let now = clock();
       const kind = "regular" as const;
       const jobKey = broadcastLogicalKey(trigger);
       if (!await repo.tryStartJob({
@@ -335,6 +379,12 @@ export async function runBroadcast(
         scheduledAt,
         startedAt: now
       })) {
+        if (!isScheduled) {
+          const eventId = await deterministicEventId(jobKey);
+          return await repo.isEventSucceeded(eventId)
+            ? "duplicate"
+            : "failed";
+        }
         return "duplicate";
       }
       startedJobKey = jobKey;
@@ -360,17 +410,33 @@ export async function runBroadcast(
       if (
         runtime.faults.auth?.authGeneration === config.authGeneration
       ) {
-        if (isScheduled) runtime.version = scheduledAt;
+        const events: NewOutboxEvent[] = [];
+        if (isScheduled) {
+          runtime.version = scheduledAt;
+          const episode = runtime.faults.auth;
+          if (!episode.warningCreated) {
+            const warning = await faultEvent(
+              "auth",
+              episode.id,
+              "warning",
+              fixturePrefix(config.sourceName),
+              now
+            );
+            episode.warningEventId = warning.id;
+            episode.warningCreated = true;
+            events.push(warning);
+          }
+        }
         await repo.commitSnapshotUnderLease({
           owner,
           now,
           jobKey,
-          jobStatus: "skipped",
+          jobStatus: isScheduled ? "skipped" : "failed",
           errorKind: "auth-blocked",
           states: [{ key: "runtime", value: runtime, version: now }],
-          events: []
+          events
         });
-        return "completed";
+        return isScheduled ? "completed" : "failed";
       }
 
       let snapshot: QuotaSnapshot;
@@ -385,6 +451,7 @@ export async function runBroadcast(
         const prefix = fixturePrefix(config.sourceName);
 
         if (errorKind === "collector-disabled") {
+          now = clock();
           await repo.commitSnapshotUnderLease({
             owner,
             now,
@@ -394,7 +461,7 @@ export async function runBroadcast(
             states: [{ key: "runtime", value: runtime, version: now }],
             events
           });
-          return "completed";
+          return isScheduled ? "completed" : "failed";
         }
 
         if (errorKind === "auth") {
@@ -412,13 +479,13 @@ export async function runBroadcast(
             kind: "auth",
             authGeneration: config.authGeneration,
             warningEventId: warning.id,
-            warningCreated: true,
+            warningCreated: isScheduled,
             startedAt: scheduledAt
           };
-          events.push(warning);
+          if (isScheduled) events.push(warning);
         } else if (errorKind === "schema") {
-          runtime.transientRegularSlots = [];
-          if (!runtime.faults.schema) {
+          if (isScheduled) runtime.transientRegularSlots = [];
+          if (isScheduled && !runtime.faults.schema) {
             const episodeId = "slot:" + scheduledAt;
             const warning = await faultEvent(
               "schema",
@@ -438,10 +505,11 @@ export async function runBroadcast(
             events.push(warning);
           }
         } else {
-          if (trigger.type === "scheduled") {
+          if (isScheduled) {
             appendTransientSlot(runtime, scheduledAt);
           }
           if (
+            isScheduled &&
             !runtime.faults.transient &&
             runtime.transientRegularSlots.length === 3
           ) {
@@ -465,6 +533,7 @@ export async function runBroadcast(
           }
         }
 
+        now = clock();
         await repo.commitSnapshotUnderLease({
           owner,
           now,
@@ -474,6 +543,21 @@ export async function runBroadcast(
           states: [{ key: "runtime", value: runtime, version: now }],
           events
         });
+        return isScheduled ? "completed" : "failed";
+      }
+
+      now = clock();
+      if (scheduledNotAfter !== undefined && now >= scheduledNotAfter) {
+        runtime.version = scheduledAt;
+        await repo.commitSnapshotUnderLease({
+          owner,
+          now,
+          jobKey,
+          jobStatus: "skipped",
+          errorKind: "stale-slot",
+          states: [{ key: "runtime", value: runtime, version: now }],
+          events: []
+        });
         return "completed";
       }
 
@@ -481,7 +565,7 @@ export async function runBroadcast(
       const events: NewOutboxEvent[] = [];
 
       const logicalKey = broadcastLogicalKey(trigger);
-      events.push(await newEvent(
+      const targetEvent = await newEvent(
         "daily",
         logicalKey,
         (eventId) => renderBroadcastMessage(
@@ -489,30 +573,33 @@ export async function runBroadcast(
           eventId,
           trigger.type === "manual"
         ),
-        nextShanghaiHour(now),
+        scheduledNotAfter ?? nextShanghaiHour(scheduledAt),
         []
-      ));
+      );
+      events.push(targetEvent);
 
-      const prefix = fixturePrefix(config.sourceName);
-      for (const faultKind of FAULT_KINDS) {
-        const episode = runtime.faults[faultKind];
-        if (!episode) continue;
-        if (
-          episode.warningCreated &&
-          await repo.isEventSucceeded(episode.warningEventId)
-        ) {
-          events.push(await faultEvent(
-            faultKind,
-            episode.id,
-            "recovery",
-            prefix,
-            now
-          ));
+      if (isScheduled) {
+        const prefix = fixturePrefix(config.sourceName);
+        for (const faultKind of FAULT_KINDS) {
+          const episode = runtime.faults[faultKind];
+          if (!episode) continue;
+          if (
+            episode.warningCreated &&
+            await repo.isEventSucceeded(episode.warningEventId)
+          ) {
+            events.push(await faultEvent(
+              faultKind,
+              episode.id,
+              "recovery",
+              prefix,
+              now
+            ));
+          }
+          delete runtime.faults[faultKind];
         }
-        delete runtime.faults[faultKind];
+        runtime.transientRegularSlots = [];
+        runtime.version = scheduledAt;
       }
-      runtime.transientRegularSlots = [];
-      if (isScheduled) runtime.version = scheduledAt;
 
       await repo.commitSnapshotUnderLease({
         owner,
@@ -525,6 +612,19 @@ export async function runBroadcast(
         ],
         events
       });
+      const report = await dispatchDue(
+        repo,
+        config.pushplus,
+        clock,
+        fetchImpl
+      );
+      dispatchedAfterCommit = true;
+      if (!isScheduled) {
+        const targetSucceeded =
+          report.acceptedEventIds.includes(targetEvent.id) ||
+          await repo.isEventSucceeded(targetEvent.id);
+        return targetSucceeded ? "completed" : "failed";
+      }
       return "completed";
     } catch (error) {
       if (startedJobKey !== undefined) {
@@ -539,6 +639,8 @@ export async function runBroadcast(
       await repo.releaseSnapshotLease(owner);
     }
   } finally {
-    await dispatchDue(repo, config.pushplus, clock, fetchImpl);
+    if (!dispatchedAfterCommit) {
+      await dispatchDue(repo, config.pushplus, clock, fetchImpl);
+    }
   }
 }

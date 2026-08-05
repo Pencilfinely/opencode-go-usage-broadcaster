@@ -12,6 +12,7 @@ Worker 在北京时间每日 09:00 至 23:00 的每个整点广播当前用量�
 
 - Node.js 22 或更高版本。
 - Cloudflare 账号，以及已完成的 Wrangler 登录。
+- GitHub CLI，以及已完成的仓库登录。
 - PushPlus 账号和私人主题。
 - 用于 PushPlus 回调的公开 Worker HTTPS 地址。
 - 仅当启用真实采集时，需在 PC 上进行一次人工授权，并安装可被 Playwright 调用的 Chrome 或 Edge。
@@ -67,13 +68,25 @@ curl.exe --get --data-urlencode "cron=0 1-15 * * *" --data-urlencode "format=jso
    npx wrangler secret put PUSHPLUS_TOPIC
    npx wrangler secret put PUSHPLUS_CALLBACK_SECRET
    npx wrangler secret put PUSHPLUS_CALLBACK_BASE_URL
-   npx wrangler secret put MANUAL_TRIGGER_SECRET
    ```
 
-   `PUSHPLUS_CALLBACK_BASE_URL` 必须使用上一步取得的 origin，格式严格为 `https://<worker-host>`，不含路径、查询或片段。回调密钥与 `MANUAL_TRIGGER_SECRET` 均至少 32 个字符，可分别在本机生成：
+   `PUSHPLUS_CALLBACK_BASE_URL` 必须使用上一步取得的 origin，格式严格为 `https://<worker-host>`，不含路径、查询或片段。回调密钥与 `MANUAL_TRIGGER_SECRET` 均至少 32 个字符；回调密钥可由密码管理器生成后在 Wrangler 提示中直接粘贴。
+
+   手动触发密钥必须让 Cloudflare Worker 与 GitHub Actions 使用同一个值。以下 PowerShell 在当前进程内生成随机值，再分别通过标准输入同步到两个 Secret 存储；密钥不会进入文件、命令参数或日志，也不会在终端回显：
 
    ```powershell
-   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+   $manualSecretBytes = [byte[]]::new(32)
+   [Security.Cryptography.RandomNumberGenerator]::Fill($manualSecretBytes)
+   $manualTriggerSecret = [Convert]::ToHexString($manualSecretBytes).ToLowerInvariant()
+
+   $manualTriggerSecret | npx wrangler secret put MANUAL_TRIGGER_SECRET
+   if ($LASTEXITCODE -ne 0) { throw 'Cloudflare 手动触发密钥同步失败。' }
+
+   $manualTriggerSecret | gh secret set MANUAL_TRIGGER_SECRET
+   if ($LASTEXITCODE -ne 0) { throw 'GitHub 手动触发密钥同步失败。' }
+
+   [Array]::Clear($manualSecretBytes, 0, $manualSecretBytes.Length)
+   $manualTriggerSecret = $null
    ```
 
    程序每次投递都会自动附带包含事件 ID、过期时间与签名的完整回调 URL；无需在 PushPlus 单独配置固定回调地址。
