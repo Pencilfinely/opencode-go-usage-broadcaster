@@ -30,6 +30,7 @@ describe("安全手动广播入口", () => {
   it.each([
     ["GET 请求", request("/admin/manual-trigger", { method: "GET" })],
     ["带查询字符串", request("/admin/manual-trigger?force=1")],
+    ["带空查询字符串", request("/admin/manual-trigger?")],
     ["缺少 Bearer", request("/admin/manual-trigger", { headers: {
       "idempotency-key": IDEMPOTENCY_KEY
     } })],

@@ -44,10 +44,15 @@ export async function handleManualTrigger(
   clock: () => number = Date.now
 ): Promise<Response> {
   const url = new URL(request.url);
+  const requestTarget = request.url.slice(url.origin.length);
+  const fragmentStart = requestTarget.indexOf("#");
+  const pathAndQuery = fragmentStart === -1
+    ? requestTarget
+    : requestTarget.slice(0, fragmentStart);
   if (
     request.method !== "POST" ||
     url.pathname !== "/admin/manual-trigger" ||
-    url.search !== "" ||
+    pathAndQuery.includes("?") ||
     !await isAuthorized(request, config.manualTriggerSecret)
   ) {
     return new Response("未找到", { status: 404 });
