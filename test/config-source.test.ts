@@ -10,6 +10,33 @@ const fixture = JSON.stringify({
   monthlyUsage: { status: "ok", resetInSec: 10800, usagePercent: 10 }
 });
 
+const USAGE_FUNCTION_ID = "0123456789abcdef".repeat(4);
+
+function usageUrl(page: number): string {
+  const url = new URL("https://opencode.ai/_server");
+  url.searchParams.set("id", USAGE_FUNCTION_ID);
+  url.searchParams.set("args", JSON.stringify({
+    t: { t: 9, i: 0, l: 2, a: [{ t: 1, s: "wrk_abc" }, { t: 0, s: page }], o: 0 },
+    f: 31,
+    m: []
+  }));
+  return url.toString();
+}
+
+function usageUrlTemplate(): { location: "url"; prefix: string; suffix: string } {
+  const zero = usageUrl(0);
+  const one = usageUrl(1);
+  let start = 0;
+  while (zero[start] === one[start]) start += 1;
+  let zeroEnd = zero.length;
+  let oneEnd = one.length;
+  while (zero[zeroEnd - 1] === one[oneEnd - 1]) {
+    zeroEnd -= 1;
+    oneEnd -= 1;
+  }
+  return { location: "url", prefix: zero.slice(0, start), suffix: zero.slice(zeroEnd) };
+}
+
 type ConfigBindingOverrides = Partial<
   Omit<
     Cloudflare.Env,
@@ -64,21 +91,13 @@ function makeV2SessionBundle(): string {
     },
     usageList: {
       firstPage: {
-        url: "https://opencode.ai/_server?id=usage.list",
-        method: "POST",
-        headers: {
-          accept: "text/javascript",
-          "content-type": "application/json"
-        },
-        body: '["wrk_abc",0]'
+        url: usageUrl(0),
+        method: "GET",
+        headers: { accept: "text/javascript" }
       },
       pagination: {
         mode: "paginated",
-        template: {
-          location: "body",
-          prefix: '["wrk_abc",',
-          suffix: "]"
-        }
+        template: usageUrlTemplate()
       }
     }
   });
@@ -148,37 +167,11 @@ describe("quota source boundary", () => {
   });
 
   it("损坏的分页模板在网络请求前归类为结构错误", async () => {
-    const invalidBundle = JSON.stringify({
-      version: 2,
-      generation: "generation-v2",
-      createdAt: "2026-08-05T03:00:00.000Z",
-      workspaceId: "wrk_abc",
-      auth: { cookie: "auth=test-cookie" },
-      goRequest: {
-        url: "https://opencode.ai/workspace/wrk_abc/go",
-        method: "GET",
-        headers: { accept: "text/html" }
-      },
-      usageList: {
-        firstPage: {
-          url: "https://opencode.ai/_server?id=usage.list",
-          method: "POST",
-          headers: {
-            accept: "text/javascript",
-            "content-type": "application/json"
-          },
-          body: '["wrk_abc",0]'
-        },
-        pagination: {
-          mode: "paginated",
-          template: {
-            location: "body",
-            prefix: '["wrk_abc",',
-            suffix: "]损坏"
-          }
-        }
-      }
-    });
+    const invalid = JSON.parse(makeV2SessionBundle()) as {
+      usageList: { pagination: { template: { suffix: string } } };
+    };
+    invalid.usageList.pagination.template.suffix += "损坏";
+    const invalidBundle = JSON.stringify(invalid);
     const config = loadConfig(makeEnv({
       USAGE_SOURCE: "opencode-console",
       OPENCODE_CONSOLE_ENABLED: "true",

@@ -4,16 +4,21 @@ import type { OpenCodeRequestDescriptor } from "./opencode-session";
 const MAX_RESPONSE_BYTES = 512 * 1024;
 
 export interface OpenCodeReplayResult {
+  body: Uint8Array;
   text: string;
   contentType: string;
 }
 
-async function readLimitedText(response: Response): Promise<string> {
+export interface OpenCodeReplayOptions {
+  serverInstance?: string;
+}
+
+async function readLimitedBody(response: Response): Promise<Uint8Array> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
     throw new SourceError("schema", "响应体超过限制");
   }
-  if (!response.body) return "";
+  if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
@@ -36,7 +41,15 @@ async function readLimitedText(response: Response): Promise<string> {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(bytes);
+  return bytes;
+}
+
+function decodeReplayText(body: Uint8Array): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw new SourceError("schema", "OpenCode 响应不是有效 UTF-8");
+  }
 }
 
 function isLoginRedirect(response: Response, requestUrl: string): boolean {
@@ -55,8 +68,15 @@ export async function replayOpenCodeRequest(
   request: OpenCodeRequestDescriptor,
   cookie: string,
   fetchImpl: typeof fetch = fetch,
-  outerSignal?: AbortSignal
+  outerSignal?: AbortSignal,
+  options: OpenCodeReplayOptions = {}
 ): Promise<OpenCodeReplayResult> {
+  if (
+    options.serverInstance !== undefined &&
+    !/^server-fn:[0-9]+$/u.test(options.serverInstance)
+  ) {
+    throw new SourceError("schema", "OpenCode 服务实例无效");
+  }
   const controller = new AbortController();
   const abortFromOuter = () => controller.abort(outerSignal?.reason);
   if (outerSignal?.aborted) abortFromOuter();
@@ -65,9 +85,16 @@ export async function replayOpenCodeRequest(
   try {
     let response: Response;
     try {
+      const headers = new Headers(request.headers);
+      headers.set("cookie", cookie);
+      headers.delete("x-server-id");
+      headers.delete("x-server-instance");
+      if (options.serverInstance !== undefined) {
+        headers.set("x-server-instance", options.serverInstance);
+      }
       response = await fetchImpl(request.url, {
         method: request.method,
-        headers: { ...request.headers, cookie },
+        headers,
         ...(request.body === undefined ? {} : { body: request.body }),
         redirect: "manual",
         signal: controller.signal
@@ -96,12 +123,18 @@ export async function replayOpenCodeRequest(
       throw new SourceError("schema", "OpenCode 响应状态无效");
     }
     try {
-      const text = await readLimitedText(response);
+      const body = await readLimitedBody(response);
       const contentType = response.headers.get("content-type");
       if (!contentType) {
         throw new SourceError("schema", "OpenCode 响应类型无效");
       }
-      return { text, contentType };
+      return {
+        body,
+        contentType,
+        get text() {
+          return decodeReplayText(body);
+        }
+      };
     } catch (error) {
       if (error instanceof SourceError) throw error;
       throw new SourceError("transient", "OpenCode 响应读取失败");

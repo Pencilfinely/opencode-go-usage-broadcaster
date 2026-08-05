@@ -1,5 +1,9 @@
 import { SourceError } from "./domain";
+import { parseSolidStartSerovalStream } from "./solidstart-seroval";
 import type { UsageRecord } from "./usage-domain";
+
+const MAX_USAGE_GRAPH_NODES = 10_000;
+const MAX_USAGE_GRAPH_DEPTH = 64;
 
 function requireRecord(value: unknown, field: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -69,28 +73,67 @@ function looksLikeUsageRecord(value: unknown): boolean {
 }
 
 function collectUsageArrays(value: unknown, output: unknown[][]): void {
-  if (Array.isArray(value)) {
-    if (value.length > 0 && value.every(looksLikeUsageRecord)) {
-      output.push(value);
-      return;
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const visited = new WeakSet<object>();
+  let visits = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    visits += 1;
+    if (visits > MAX_USAGE_GRAPH_NODES || current.depth > MAX_USAGE_GRAPH_DEPTH) {
+      throw new SourceError("schema", "usage.list 响应结构过于复杂");
     }
-    for (const child of value) collectUsageArrays(child, output);
-    return;
-  }
-  if (typeof value === "object" && value !== null) {
-    for (const child of Object.values(value)) collectUsageArrays(child, output);
+    if (typeof current.value !== "object" || current.value === null) continue;
+    if (visited.has(current.value)) {
+      throw new SourceError("schema", "usage.list 响应包含重复容器引用");
+    }
+    visited.add(current.value);
+    if (Array.isArray(current.value)) {
+      if (current.value.length > 0 && current.value.every(looksLikeUsageRecord)) {
+        output.push(current.value);
+        continue;
+      }
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        pending.push({ value: current.value[index], depth: current.depth + 1 });
+      }
+      continue;
+    }
+    const children = Object.values(current.value);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      pending.push({ value: children[index], depth: current.depth + 1 });
+    }
   }
 }
 
-export function parseUsageListPage(text: string, contentType: string): UsageRecord[] {
+function startsWithFrameHeader(input: string | Uint8Array): boolean {
+  return typeof input === "string"
+    ? input.startsWith(";0x")
+    : input[0] === 0x3b && input[1] === 0x30 && input[2] === 0x78;
+}
+
+function decodeUtf8(input: string | Uint8Array): string {
+  if (typeof input === "string") return input;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(input);
+  } catch {
+    throw new SourceError("schema", "usage.list 响应不是有效 UTF-8");
+  }
+}
+
+export function parseUsageListPage(
+  input: string | Uint8Array,
+  contentType: string
+): UsageRecord[] {
   const mediaType = contentType.split(";", 1)[0]!.trim().toLowerCase();
   if (!["application/json", "text/javascript", "text/plain"].includes(mediaType)) {
     throw new SourceError("schema", "usage.list 响应类型无效");
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
-  } catch {
+    parsed = mediaType === "text/javascript" && startsWithFrameHeader(input)
+      ? parseSolidStartSerovalStream(input)
+      : JSON.parse(decodeUtf8(input));
+  } catch (error) {
+    if (error instanceof SourceError) throw error;
     throw new SourceError("schema", "usage.list 响应不是有效 JSON");
   }
   if (Array.isArray(parsed) && parsed.length === 0) return [];

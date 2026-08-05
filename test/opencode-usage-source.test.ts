@@ -2,7 +2,41 @@ import { describe, expect, it } from "vitest";
 import {
   OpenCodeUsageListSource
 } from "../src/opencode-usage-source";
+import { replayOpenCodeRequest } from "../src/opencode-http";
 import type { UsagePaginationAuthorization } from "../src/opencode-session";
+
+const USAGE_FUNCTION_ID = "0123456789abcdef".repeat(4);
+
+function usageUrl(page: number): string {
+  const url = new URL("https://opencode.ai/_server");
+  url.searchParams.set("id", USAGE_FUNCTION_ID);
+  url.searchParams.set("args", JSON.stringify({
+    t: {
+      t: 9,
+      i: 0,
+      l: 2,
+      a: [{ t: 1, s: "wrk_abc" }, { t: 0, s: page }],
+      o: 0
+    },
+    f: 31,
+    m: []
+  }));
+  return url.toString();
+}
+
+function urlPageTemplate(): { location: "url"; prefix: string; suffix: string } {
+  const zero = usageUrl(0);
+  const one = usageUrl(1);
+  let start = 0;
+  while (zero[start] === one[start]) start += 1;
+  let zeroEnd = zero.length;
+  let oneEnd = one.length;
+  while (zero[zeroEnd - 1] === one[oneEnd - 1]) {
+    zeroEnd -= 1;
+    oneEnd -= 1;
+  }
+  return { location: "url", prefix: zero.slice(0, start), suffix: zero.slice(zeroEnd) };
+}
 
 function pageOf(count: number, start: number): unknown[] {
   return Array.from({ length: count }, (_, index) => ({
@@ -24,11 +58,7 @@ function pageOf(count: number, start: number): unknown[] {
 function makeRawV2Bundle(
   pagination: UsagePaginationAuthorization = {
     mode: "paginated",
-    template: {
-      location: "body",
-      prefix: '["wrk_abc",',
-      suffix: "]"
-    }
+    template: urlPageTemplate()
   }
 ): string {
   return JSON.stringify({
@@ -44,13 +74,9 @@ function makeRawV2Bundle(
     },
     usageList: {
       firstPage: {
-        url: "https://opencode.ai/_server?id=usage.list",
-        method: "POST",
-        headers: {
-          accept: "text/javascript",
-          "content-type": "application/json"
-        },
-        body: '["wrk_abc",0]'
+        url: usageUrl(0),
+        method: "GET",
+        headers: { accept: "text/javascript" }
       },
       pagination
     }
@@ -78,8 +104,11 @@ function makePaginatedSource(input: {
 }): OpenCodeUsageListSource {
   return new OpenCodeUsageListSource(
     makeRawV2Bundle(),
-    async (_url, init) => {
-      const page = Number(JSON.parse(String(init?.body))[1]);
+    async (url, _init) => {
+      const args = JSON.parse(new URL(String(url)).searchParams.get("args") ?? "null") as {
+        t: { a: [unknown, { s: number }] };
+      };
+      const page = args.t.a[1].s;
       input.onPage?.(page);
       return new Response(JSON.stringify(input.pages[page] ?? []), {
         headers: { "content-type": "application/json" }
@@ -104,6 +133,60 @@ function makeFortyFullPagesSource(): OpenCodeUsageListSource {
 }
 
 describe("OpenCode 用量明细分页来源", () => {
+  it("以内部页号注入实例头，且会话包不保存任何 X-Server 头", async () => {
+    const bundle = JSON.parse(makeRawV2Bundle()) as {
+      usageList: { firstPage: { headers: Record<string, string> } };
+    };
+    expect(bundle.usageList.firstPage.headers["x-server-instance"]).toBeUndefined();
+    expect(bundle.usageList.firstPage.headers["x-server-id"]).toBeUndefined();
+
+    const calls: Array<{ page: number; headers: Headers }> = [];
+    const source = new OpenCodeUsageListSource(
+      makeRawV2Bundle(),
+      async (url, init) => {
+        const args = JSON.parse(new URL(String(url)).searchParams.get("args") ?? "null") as {
+          t: { a: [unknown, { s: number }] };
+        };
+        const page = args.t.a[1].s;
+        calls.push({ page, headers: new Headers(init?.headers) });
+        return new Response(JSON.stringify(page === 0 ? pageOf(50, 0) : pageOf(1, 50)), {
+          headers: { "content-type": "application/json" }
+        });
+      }
+    );
+
+    await source.fetch(Date.parse("2026-08-05T03:30:00.000Z"));
+
+    expect(calls.map(({ page, headers }) => ({
+      page,
+      cookie: headers.get("cookie"),
+      instance: headers.get("x-server-instance"),
+      serverId: headers.get("x-server-id")
+    }))).toEqual([
+      { page: 0, cookie: "auth=test-cookie", instance: "server-fn:0", serverId: null },
+      { page: 1, cookie: "auth=test-cookie", instance: "server-fn:1", serverId: null }
+    ]);
+  });
+
+  it("拒绝调用方提供无效实例头", async () => {
+    let fetchCalls = 0;
+    await expect(replayOpenCodeRequest(
+      {
+        url: usageUrl(0),
+        method: "GET",
+        headers: { accept: "text/javascript" }
+      },
+      "auth=test-cookie",
+      async () => {
+        fetchCalls += 1;
+        return new Response("[]", { headers: { "content-type": "application/json" } });
+      },
+      undefined,
+      { serverInstance: "server-fn:-1" }
+    )).rejects.toMatchObject({ kind: "schema" });
+    expect(fetchCalls).toBe(0);
+  });
+
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
     "版本 1 在观察时间 %p 时立即降级且不发网络请求",
     async (observedAt) => {

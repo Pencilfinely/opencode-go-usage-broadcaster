@@ -256,10 +256,15 @@ function requestFromResponse(response: Response): OpenCodeRequestDescriptor {
   });
 }
 
-async function responseTextWithinLimit(response: Response): Promise<string> {
+async function responseBodyWithinLimit(response: Response): Promise<Buffer> {
   const body = await response.body();
   requireCaptureSize(body, "捕获响应体");
-  return body.toString("utf8");
+  return body;
+}
+
+async function responseTextWithinLimit(response: Response): Promise<string> {
+  const body = await responseBodyWithinLimit(response);
+  return new TextDecoder("utf-8", { fatal: true }).decode(body);
 }
 
 export async function waitForGoRequest(
@@ -309,10 +314,10 @@ export async function waitForUsageListPage(
         workspaceId,
         expectedPage
       );
-      const text = await responseTextWithinLimit(response);
+      const body = await responseBodyWithinLimit(response);
       const candidate = {
         request,
-        records: parseUsageListPage(text, response.headers()["content-type"] ?? "")
+        records: parseUsageListPage(body, response.headers()["content-type"] ?? "")
       };
       if (!accept(candidate)) return false;
       accepted = candidate;

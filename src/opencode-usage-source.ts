@@ -92,7 +92,8 @@ export class OpenCodeUsageListSource implements UsageDetailsSource {
           request,
           bundle.auth.cookie,
           this.fetchImpl,
-          deadlineController.signal
+          deadlineController.signal,
+          { serverInstance: `server-fn:${page}` }
         );
       } catch (error) {
         if (deadlineController.signal.aborted && this.clock() >= deadline) {
@@ -103,7 +104,7 @@ export class OpenCodeUsageListSource implements UsageDetailsSource {
         clearTimeout(deadlineTimer);
       }
 
-      const pageRecords = parseUsageListPage(replay.text, replay.contentType);
+      const pageRecords = parseUsageListPage(replay.body, replay.contentType);
       pagesRead += 1;
       if (this.clock() >= deadline) {
         return { status: "truncated", records, pagesRead, reason: "deadline" };
