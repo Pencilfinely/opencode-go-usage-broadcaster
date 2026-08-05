@@ -77,13 +77,14 @@ export class OpenCodeUsageListSource implements UsageDetailsSource {
             page
       );
       validateUsageListRequestDescriptor(request, bundle.workspaceId, page);
-      if (this.clock() >= deadline) {
+      const remaining = deadline - this.clock();
+      if (remaining <= 0) {
         return { status: "truncated", records, pagesRead, reason: "deadline" };
       }
       const deadlineController = new AbortController();
       const deadlineTimer = setTimeout(
         () => deadlineController.abort(),
-        Math.max(0, deadline - this.clock())
+        remaining
       );
       let replay;
       try {

@@ -232,4 +232,32 @@ describe("OpenCode 用量明细分页来源", () => {
     });
     expect(fetchCalls).toBe(0);
   });
+
+  it("回放前用单次取时固定计时器预算", async () => {
+    const clockValues = [0, 24_998, 24_999, 25_000];
+    let fetchCalls = 0;
+    let clockCalls = 0;
+    const source = new OpenCodeUsageListSource(
+      makeRawV2Bundle(),
+      async () => {
+        fetchCalls += 1;
+        expect(clockCalls).toBe(3);
+        return new Response(JSON.stringify(pageOf(1, 0)), {
+          headers: { "content-type": "application/json" }
+        });
+      },
+      () => {
+        clockCalls += 1;
+        return clockValues.shift() ?? 25_000;
+      }
+    );
+
+    await expect(source.fetch(Date.parse("2026-08-05T03:30:00.000Z"))).resolves.toEqual({
+      status: "truncated",
+      records: [],
+      pagesRead: 1,
+      reason: "deadline"
+    });
+    expect(fetchCalls).toBe(1);
+  });
 });
