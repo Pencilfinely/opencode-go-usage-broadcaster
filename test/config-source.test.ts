@@ -17,6 +17,7 @@ type ConfigBindingOverrides = Partial<
     | "OPENCODE_CONSOLE_ENABLED"
     | "OPENCODE_AUTH_GENERATION"
     | "OPENCODE_SESSION_BUNDLE"
+    | "MANUAL_TRIGGER_SECRET"
   >
 > & {
   USAGE_SOURCE?: string;
@@ -24,6 +25,7 @@ type ConfigBindingOverrides = Partial<
   OPENCODE_CONSOLE_ENABLED?: string;
   OPENCODE_AUTH_GENERATION?: string | undefined;
   OPENCODE_SESSION_BUNDLE?: string | undefined;
+  MANUAL_TRIGGER_SECRET?: string | undefined;
 };
 
 function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
@@ -36,11 +38,21 @@ function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
     PUSHPLUS_TOPIC: "test-topic",
     PUSHPLUS_CALLBACK_SECRET: "test-callback-secret-32-bytes-minimum",
     PUSHPLUS_CALLBACK_BASE_URL: "https://worker.test",
+    MANUAL_TRIGGER_SECRET: "test-manual-trigger-secret-32-bytes-minimum",
     ...overrides
   } as Cloudflare.Env;
 }
 
 describe("quota source boundary", () => {
+  it.each([
+    ["缺失", undefined],
+    ["少于 32 个字符", "too-short"]
+  ])("手动触发 Secret %s时拒绝加载配置", (_caseName, secret) => {
+    expect(() => loadConfig(makeEnv({
+      MANUAL_TRIGGER_SECRET: secret
+    }))).toThrow();
+  });
+
   it("parses all three fixture windows", async () => {
     const source = createQuotaSource(loadConfig(makeEnv()));
     const snapshot = await source.fetch(new Date("2026-08-03T01:00:00Z"));

@@ -377,11 +377,12 @@ export class Repository {
       "EXISTS (SELECT 1 FROM outbox_events WHERE id = ? " +
       "AND status = 'sending' AND attempt_count = ? AND lease_owner = ? " +
       "AND lease_until > ? AND not_after > ?)";
+    // 仅在当前发送租约有效时，将本次尝试、事件和关联触发条件一并终结。
     const results = await this.db.batch([
       this.db
         .prepare(
           "UPDATE outbox_attempts SET provider_message_id = ?, " +
-          "status = 'accepted', updated_at = ? " +
+          "status = 'succeeded', updated_at = ? " +
           "WHERE event_id = ? AND attempt_no = ? AND status = 'sending' " +
           "AND " + currentSending
         )
@@ -398,17 +399,16 @@ export class Repository {
         ),
       this.db
         .prepare(
-          "UPDATE outbox_events SET status = 'waiting_callback', " +
+          "UPDATE outbox_events SET status = 'succeeded', " +
           "provider_message_id = ?, lease_owner = NULL, lease_until = NULL, " +
-          "next_attempt_at = ?, updated_at = ? " +
+          "updated_at = ? " +
           "WHERE id = ? AND status = 'sending' AND attempt_count = ? " +
           "AND lease_owner = ? AND lease_until > ? AND not_after > ? " +
           "AND EXISTS (SELECT 1 FROM outbox_attempts WHERE event_id = ? " +
-          "AND attempt_no = ? AND provider_message_id = ? AND status = 'accepted')"
+          "AND attempt_no = ? AND provider_message_id = ? AND status = 'succeeded')"
         )
         .bind(
           shortCode,
-          now + 30 * 60 * 1000,
           now,
           eventId,
           attemptNo,
@@ -418,7 +418,15 @@ export class Repository {
           eventId,
           attemptNo,
           shortCode
+        ),
+      this.db
+        .prepare(
+          "UPDATE event_triggers SET state = 'delivered' " +
+          "WHERE event_id = ? AND state = 'reserved' AND EXISTS (" +
+          "SELECT 1 FROM outbox_events WHERE id = ? " +
+          "AND status = 'succeeded')"
         )
+        .bind(eventId, eventId)
     ]);
     return results[1]!.meta.changes === 1;
   }

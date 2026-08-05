@@ -6,6 +6,11 @@ const PUSHPLUS_URL = "https://www.pushplus.plus/send";
 const MAX_CALLBACK_BODY_BYTES = 4096;
 const RETRY_DELAY_MS = 30 * 60 * 1000;
 
+export interface DispatchReport {
+  acceptedEventIds: string[];
+  failedEventIds: string[];
+}
+
 function base64url(bytes: Uint8Array): string {
   let value = "";
   for (const byte of bytes) value += String.fromCharCode(byte);
@@ -65,12 +70,16 @@ export async function dispatchDue(
   config: AppConfig["pushplus"],
   clock: () => number = Date.now,
   fetchImpl: typeof fetch = fetch
-): Promise<void> {
+): Promise<DispatchReport> {
+  const report: DispatchReport = {
+    acceptedEventIds: [],
+    failedEventIds: []
+  };
   for (let sent = 0; sent < 5; sent += 1) {
     const owner = crypto.randomUUID();
     const claimNow = clock();
     const event = await repo.claimDueEvent(owner, claimNow, 60_000);
-    if (!event) return;
+    if (!event) return report;
     const signature = await signCallback(
       config.callbackSecret,
       event.id,
@@ -93,7 +102,8 @@ export async function dispatchDue(
         event.leaseOwner,
         prepareNow
       );
-      return;
+      report.failedEventIds.push(event.id);
+      return report;
     }
     const renewedLeaseUntil = await repo.prepareDispatchClaim(
       event.id,
@@ -109,7 +119,8 @@ export async function dispatchDue(
         event.leaseOwner,
         clock()
       );
-      return;
+      report.failedEventIds.push(event.id);
+      return report;
     }
 
     const sendNow = clock();
@@ -120,7 +131,8 @@ export async function dispatchDue(
         event.leaseOwner,
         sendNow
       );
-      return;
+      report.failedEventIds.push(event.id);
+      return report;
     }
     try {
       const response = await fetchImpl(PUSHPLUS_URL, {
@@ -161,6 +173,9 @@ export async function dispatchDue(
           event.leaseOwner,
           responseNow
         );
+        report.failedEventIds.push(event.id);
+      } else {
+        report.acceptedEventIds.push(event.id);
       }
     } catch {
       const failureNow = clock();
@@ -179,8 +194,10 @@ export async function dispatchDue(
           failureNow
         );
       }
+      report.failedEventIds.push(event.id);
     }
   }
+  return report;
 }
 
 async function readBoundedCallbackBody(request: Request): Promise<string | null> {

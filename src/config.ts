@@ -5,6 +5,7 @@ export interface AppConfig {
   fixtureJson: string;
   consoleEnabled: boolean;
   authGeneration: string;
+  manualTriggerSecret: string;
   sessionBundle?: string;
   pushplus: {
     token: string;
@@ -72,6 +73,14 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     throw new Error("PUSHPLUS_CALLBACK_SECRET must be at least 32 characters");
   }
 
+  const manualTriggerSecret = required(
+    bindings.MANUAL_TRIGGER_SECRET,
+    "MANUAL_TRIGGER_SECRET"
+  );
+  if (manualTriggerSecret.length < 32) {
+    throw new Error("MANUAL_TRIGGER_SECRET must be at least 32 characters");
+  }
+
   const consoleEnabled = bindings.OPENCODE_CONSOLE_ENABLED === "true";
   const sessionBundle = sourceName === "opencode-console" && consoleEnabled
     ? bindings.OPENCODE_SESSION_BUNDLE
@@ -81,6 +90,7 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     sourceName,
     fixtureJson: bindings.USAGE_FIXTURE_JSON ?? "",
     consoleEnabled,
+    manualTriggerSecret,
     authGeneration: sourceName === "opencode-console" && consoleEnabled
       ? sessionAuthGeneration(sessionBundle)
       : required(bindings.OPENCODE_AUTH_GENERATION, "OPENCODE_AUTH_GENERATION"),

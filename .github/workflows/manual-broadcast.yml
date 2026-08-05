@@ -1,0 +1,32 @@
+name: 手动发送 OpenCode Go 用量
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  broadcast:
+    name: 发送手动广播
+    runs-on: ubuntu-latest
+    steps:
+      - name: 调用生产广播入口
+        env:
+          MANUAL_TRIGGER_SECRET: ${{ secrets.MANUAL_TRIGGER_SECRET }}
+          IDEMPOTENCY_KEY: manual-${{ github.run_id }}
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(
+            "https://opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev/admin/manual-trigger",
+            {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${process.env.MANUAL_TRIGGER_SECRET}`,
+                "idempotency-key": process.env.IDEMPOTENCY_KEY
+              }
+            }
+          );
+          if (!response.ok) {
+            throw new Error(`手动广播失败，HTTP 状态码：${response.status}`);
+          }
+          NODE

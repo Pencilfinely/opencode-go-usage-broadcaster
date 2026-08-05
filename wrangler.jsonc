@@ -12,7 +12,7 @@
     }
   ],
   "triggers": {
-    "crons": ["*/30 * * * *", "7 1 * * *"]
+    "crons": ["0 1-15 * * *"]
   },
   "vars": {
     "USAGE_SOURCE": "opencode-console",
@@ -26,6 +26,7 @@
       "PUSHPLUS_TOPIC",
       "PUSHPLUS_CALLBACK_SECRET",
       "PUSHPLUS_CALLBACK_BASE_URL",
+      "MANUAL_TRIGGER_SECRET",
       "OPENCODE_SESSION_BUNDLE"
     ]
   }
