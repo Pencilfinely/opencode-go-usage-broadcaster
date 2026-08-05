@@ -68,4 +68,19 @@ describe("OpenCode 会话包", () => {
       }
     }))).toMatchObject({ version: 1, generation: "generation-v1" });
   });
+
+  it("拒绝只替换无关查询值的分页模板", () => {
+    const invalid = makeV2Bundle();
+    invalid.usageList.firstPage.url = "https://opencode.ai/_server?id=usage.list0&source=console";
+    invalid.usageList.pagination = {
+      mode: "paginated",
+      template: {
+        location: "url",
+        prefix: "https://opencode.ai/_server?id=usage.list",
+        suffix: "&source=console"
+      }
+    };
+
+    expect(() => parseSessionBundle(JSON.stringify(invalid))).toThrow();
+  });
 });

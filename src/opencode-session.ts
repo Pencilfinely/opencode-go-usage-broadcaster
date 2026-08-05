@@ -249,7 +249,11 @@ export function renderUsagePageRequest(
     : { ...firstPage, body: rendered };
 }
 
-function parsePagination(value: unknown, firstPage: OpenCodeRequestDescriptor): UsagePaginationAuthorization {
+function parsePagination(
+  value: unknown,
+  firstPage: OpenCodeRequestDescriptor,
+  workspaceId: string
+): UsagePaginationAuthorization {
   if (!record(value)) throw new SourceError("schema", "会话包字段无效：usageList.pagination");
   if (value.mode === "single-page") {
     assertAllowedKeys(value, ["mode"], "usageList.pagination");
@@ -281,6 +285,11 @@ function parsePagination(value: unknown, firstPage: OpenCodeRequestDescriptor): 
   if (zeroPage.url !== firstPage.url || zeroPage.body !== firstPage.body) {
     throw new SourceError("schema", "usage.list 分页模板与首页不一致");
   }
+  validateUsageListRequestDescriptor(
+    renderUsagePageRequest(firstPage, template, 1),
+    workspaceId,
+    1
+  );
   return { mode: "paginated", template };
 }
 
@@ -335,7 +344,7 @@ export function parseSessionBundle(raw: string): OpenCodeSessionBundle {
     workspaceId,
     0
   );
-  const pagination = parsePagination(value.usageList.pagination, firstPage);
+  const pagination = parsePagination(value.usageList.pagination, firstPage, workspaceId);
   return {
     version: 2,
     generation,
