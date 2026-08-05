@@ -29,3 +29,47 @@ export type UsageCollectionResult =
 export interface UsageDetailsSource {
   fetch(observedAt: number): Promise<UsageCollectionResult>;
 }
+
+export interface UsageTokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheTokens: number;
+  totalTokens: number;
+}
+
+export interface UsageHourBucket {
+  startAt: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheTokens: number;
+}
+
+export interface UsageModelTotal {
+  model: string;
+  tokenCount: number;
+  sharePercent: number;
+}
+
+export interface UsageAggregate {
+  observedAt: number;
+  windowStartAt: number;
+  truncated: boolean;
+  requestCount: number;
+  costMicroCents: number;
+  tokens: UsageTokenTotals;
+  buckets: UsageHourBucket[];
+  models: UsageModelTotal[];
+}
+
+export type UsageUnavailableReason =
+  | "not-authorized"
+  | "single-page-full"
+  | "auth"
+  | "transient"
+  | "schema";
+
+export type UsageDetailsView =
+  | { status: "available"; aggregate: UsageAggregate; chartUrl?: string }
+  | { status: "unavailable"; reason: UsageUnavailableReason };
