@@ -75,7 +75,13 @@ export async function replayOpenCodeRequest(
     } catch {
       throw new SourceError("transient", "OpenCode 请求失败或超时");
     }
-    if (response.status === 401 || response.status === 403 || isLoginRedirect(response, request.url)) {
+    if (
+      response.status === 301 ||
+      response.status === 303 ||
+      response.status === 401 ||
+      response.status === 403 ||
+      isLoginRedirect(response, request.url)
+    ) {
       throw new SourceError("auth", "OpenCode 会话已失效");
     }
     if (response.status === 408 || response.status === 429 || response.status >= 500) {

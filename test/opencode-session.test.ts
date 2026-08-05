@@ -161,6 +161,20 @@ describe("OpenCode 控制台采集器", () => {
     });
   });
 
+  it.each([301, 303])("将 %s 重定向归类为认证错误", async (status) => {
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(null, {
+        status,
+        headers: { location: "/workspace/workspace-1/go" }
+      }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "auth"
+    });
+  });
+
   it("将跨源 login 重定向归类为结构错误", async () => {
     const source = new OpenCodeConsoleQuotaSource(
       bundle(),
