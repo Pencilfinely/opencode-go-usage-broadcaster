@@ -13,6 +13,7 @@ import {
   buildSessionBundle as buildV2SessionBundle,
   deriveUsagePageNumberTemplate,
   OPENCODE_ORIGIN,
+  waitBeforeTrigger,
   waitForGoRequest,
   waitForUsageListPage
 } from "./opencode-usage-capture";
@@ -158,18 +159,26 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
 
     const workspaceId = await waitForWorkspaceId(context, signal);
     signal.throwIfAborted();
-    const goRequestPromise = waitForGoRequest(page, workspaceId, signal);
-    await page.goto(`${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`, { signal });
-    const goRequest = await goRequestPromise;
+    const goRequest = await waitBeforeTrigger(
+      signal,
+      (waiterSignal) => waitForGoRequest(page, workspaceId, waiterSignal),
+      (triggerSignal) => page.goto(
+        `${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`,
+        { signal: triggerSignal }
+      ).then(() => undefined)
+    );
     const authCookie = (await context.cookies(OPENCODE_ORIGIN)).find(
       (cookie) => cookie.name === "auth"
     );
     if (!authCookie) {
       throw new Error("已识别工作区，但未检测到 OpenCode auth Cookie");
     }
-    const page0Promise = waitForUsageListPage(page, signal);
-    await page.goto(`${OPENCODE_ORIGIN}/usage`, { signal });
-    const page0 = await page0Promise;
+    const page0 = await waitBeforeTrigger(
+      signal,
+      (waiterSignal) => waitForUsageListPage(page, waiterSignal),
+      (triggerSignal) => page.goto(`${OPENCODE_ORIGIN}/usage`, { signal: triggerSignal })
+        .then(() => undefined)
+    );
     const usageList: OpenCodeSessionBundleV2["usageList"] = page0.records.length < 50
       ? { firstPage: page0.request, pagination: { mode: "single-page" } }
       : await (async () => {
@@ -179,13 +188,18 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
           if (await paginationButtons.count() !== 2) {
             throw new Error("未找到唯一的 usage 分页控件");
           }
-          const page1Promise = waitForUsageListPage(
-            page,
+          const page1 = await waitBeforeTrigger(
             signal,
-            (candidate) => JSON.stringify(candidate.request) !== JSON.stringify(page0.request)
+            (waiterSignal) => waitForUsageListPage(
+              page,
+              waiterSignal,
+              (candidate) => JSON.stringify(candidate.request) !== JSON.stringify(page0.request)
+            ),
+            (triggerSignal) => paginationButtons.nth(1).click({
+              timeout: 10_000,
+              signal: triggerSignal
+            })
           );
-          await paginationButtons.nth(1).click({ timeout: 10_000, signal });
-          const page1 = await page1Promise;
           return {
             firstPage: page0.request,
             pagination: {

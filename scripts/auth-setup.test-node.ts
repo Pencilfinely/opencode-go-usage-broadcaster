@@ -9,6 +9,40 @@ import {
   type UploadChild
 } from "./auth-setup";
 
+test("触发失败时取消内部 waiter 并回收其拒绝后重抛原始错误", async () => {
+  const module = await import("./opencode-usage-capture");
+  const waitBeforeTrigger = (module as Record<string, unknown>)
+    .waitBeforeTrigger as ((
+      externalSignal: AbortSignal,
+      startWaiter: (signal: AbortSignal) => Promise<unknown>,
+      trigger: (signal: AbortSignal) => Promise<void>
+    ) => Promise<unknown>) | undefined;
+  if (!waitBeforeTrigger) throw new Error("缺少等待触发协作器");
+  const triggerError = new Error("触发动作失败");
+  let receivedSignal: AbortSignal | undefined;
+  let waiterSettled = false;
+
+  await assert.rejects(
+    waitBeforeTrigger?.(
+      new AbortController().signal,
+      (signal) => new Promise((_, reject) => {
+        receivedSignal = signal;
+        signal.addEventListener("abort", () => {
+          queueMicrotask(() => {
+            waiterSettled = true;
+            reject(new Error("waiter 已取消"));
+          });
+        }, { once: true });
+      }),
+      async () => { throw triggerError; }
+    ),
+    (error: unknown) => error === triggerError
+  );
+
+  assert.equal(receivedSignal?.aborted, true);
+  assert.equal(waiterSettled, true);
+});
+
 test("只保留捕获请求的必要头", async () => {
   const module = await import("./opencode-usage-capture");
   const minimizeCapturedRequest = (module as Record<string, unknown>)

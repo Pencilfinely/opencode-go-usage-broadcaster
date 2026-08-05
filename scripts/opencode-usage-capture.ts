@@ -26,6 +26,51 @@ export interface CapturedUsagePage {
   records: ReturnType<typeof parseUsageListPage>;
 }
 
+type WaiterResult<T> =
+  | { state: "fulfilled"; value: T }
+  | { state: "rejected"; error: unknown };
+
+/** 先登记 waiter，再执行触发动作；触发失败时回收 waiter 的拒绝。 */
+export async function waitBeforeTrigger<T>(
+  externalSignal: AbortSignal,
+  startWaiter: (signal: AbortSignal) => Promise<T>,
+  trigger: (signal: AbortSignal) => Promise<void>
+): Promise<T> {
+  externalSignal.throwIfAborted();
+  const controller = new AbortController();
+  const forwardExternalAbort = () => controller.abort(externalSignal.reason);
+  externalSignal.addEventListener("abort", forwardExternalAbort, { once: true });
+  if (externalSignal.aborted) forwardExternalAbort();
+
+  let waiter: Promise<T>;
+  try {
+    waiter = startWaiter(controller.signal);
+  } catch (error) {
+    controller.abort(error);
+    externalSignal.removeEventListener("abort", forwardExternalAbort);
+    throw error;
+  }
+  const settledWaiter: Promise<WaiterResult<T>> = waiter.then(
+    (value) => ({ state: "fulfilled", value }),
+    (error: unknown) => ({ state: "rejected", error })
+  );
+
+  try {
+    controller.signal.throwIfAborted();
+    await trigger(controller.signal);
+    const result = await settledWaiter;
+    if (result.state === "rejected") throw result.error;
+    return result.value;
+  } catch (error) {
+    controller.abort(error);
+    await settledWaiter;
+    throw error;
+  } finally {
+    controller.abort();
+    externalSignal.removeEventListener("abort", forwardExternalAbort);
+  }
+}
+
 function requireCaptureSize(value: string | Buffer, description: string): void {
   if (Buffer.byteLength(value) > MAX_CAPTURE_BYTES) {
     throw new Error(`${description}超过 512 KiB 限制`);
