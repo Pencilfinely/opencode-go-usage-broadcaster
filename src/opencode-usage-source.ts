@@ -44,9 +44,6 @@ export class OpenCodeUsageListSource implements UsageDetailsSource {
   ) {}
 
   async fetch(observedAt: number): Promise<UsageCollectionResult> {
-    if (!Number.isFinite(observedAt)) {
-      throw new SourceError("schema", "usage.list 观察时间无效");
-    }
     const bundle = parseSessionBundle(
       typeof this.rawBundle === "string"
         ? this.rawBundle
@@ -54,6 +51,9 @@ export class OpenCodeUsageListSource implements UsageDetailsSource {
     );
     if (bundle.version === 1) {
       return { status: "unavailable", reason: "not-authorized" };
+    }
+    if (!Number.isFinite(observedAt)) {
+      throw new SourceError("schema", "usage.list 观察时间无效");
     }
 
     const shanghaiHourStart =
@@ -75,8 +75,11 @@ export class OpenCodeUsageListSource implements UsageDetailsSource {
             bundle.usageList.firstPage,
             requirePaginationTemplate(bundle.usageList.pagination),
             page
-          );
+      );
       validateUsageListRequestDescriptor(request, bundle.workspaceId, page);
+      if (this.clock() >= deadline) {
+        return { status: "truncated", records, pagesRead, reason: "deadline" };
+      }
       const deadlineController = new AbortController();
       const deadlineTimer = setTimeout(
         () => deadlineController.abort(),

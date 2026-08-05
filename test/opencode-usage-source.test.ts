@@ -57,6 +57,21 @@ function makeRawV2Bundle(
   });
 }
 
+function makeRawV1Bundle(): string {
+  return JSON.stringify({
+    version: 1,
+    generation: "generation-v1",
+    createdAt: "2026-08-05T03:00:00.000Z",
+    workspaceId: "wrk_abc",
+    auth: { cookie: "auth=test-cookie" },
+    request: {
+      url: "https://opencode.ai/workspace/wrk_abc/go",
+      method: "GET",
+      headers: { accept: "text/html" }
+    }
+  });
+}
+
 function makePaginatedSource(input: {
   pages: unknown[][];
   onPage?: (page: number) => void;
@@ -89,6 +104,26 @@ function makeFortyFullPagesSource(): OpenCodeUsageListSource {
 }
 
 describe("OpenCode 用量明细分页来源", () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "版本 1 在观察时间 %p 时立即降级且不发网络请求",
+    async (observedAt) => {
+      let fetchCalls = 0;
+      const source = new OpenCodeUsageListSource(
+        makeRawV1Bundle(),
+        async () => {
+          fetchCalls += 1;
+          return new Response("测试不应发出请求");
+        }
+      );
+
+      await expect(source.fetch(observedAt)).resolves.toEqual({
+        status: "unavailable",
+        reason: "not-authorized"
+      });
+      expect(fetchCalls).toBe(0);
+    }
+  );
+
   it("串行读取并去除分页边界重复", async () => {
     const calls: number[] = [];
     const source = makePaginatedSource({
@@ -173,5 +208,28 @@ describe("OpenCode 用量明细分页来源", () => {
       pagesRead: 1,
       reason: "deadline"
     });
+  });
+
+  it("回放前到达总预算时不发起网络请求", async () => {
+    const clockValues = [0, 24_999, 25_000];
+    let fetchCalls = 0;
+    const source = new OpenCodeUsageListSource(
+      makeRawV2Bundle(),
+      async () => {
+        fetchCalls += 1;
+        return new Response(JSON.stringify(pageOf(1, 0)), {
+          headers: { "content-type": "application/json" }
+        });
+      },
+      () => clockValues.shift() ?? 25_000
+    );
+
+    await expect(source.fetch(Date.parse("2026-08-05T03:30:00.000Z"))).resolves.toEqual({
+      status: "truncated",
+      records: [],
+      pagesRead: 0,
+      reason: "deadline"
+    });
+    expect(fetchCalls).toBe(0);
   });
 });
