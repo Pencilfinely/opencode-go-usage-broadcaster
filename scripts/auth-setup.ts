@@ -114,6 +114,7 @@ export async function navigateWithinOpenCodeApp(
         createElement(tag: "a"): {
           href: string;
           hidden: boolean;
+          setAttribute(name: string, value: string): void;
           click(): void;
           remove(): void;
         };
@@ -123,6 +124,7 @@ export async function navigateWithinOpenCodeApp(
     const anchor = browserDocument.createElement("a");
     anchor.href = href;
     anchor.hidden = true;
+    anchor.setAttribute("link", "");
     browserDocument.body.append(anchor);
     try {
       anchor.click();

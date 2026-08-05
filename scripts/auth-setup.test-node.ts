@@ -418,9 +418,13 @@ test("通过同源 SPA 锚点导航 usage 页面且不使用完整文档跳转",
   const actions: string[] = [];
   let createdTag = "";
   let anchorHref = "";
+  const anchorAttributes = new Map<string, string>();
   const anchor = {
     hidden: false,
     set href(value: string) { anchorHref = value; },
+    setAttribute(name: string, value: string) {
+      anchorAttributes.set(name, value);
+    },
     click() { actions.push("点击"); },
     remove() { actions.push("移除"); }
   };
@@ -463,6 +467,7 @@ test("通过同源 SPA 锚点导航 usage 页面且不使用完整文档跳转",
   assert.equal(createdTag, "a");
   assert.equal(anchorHref, "https://opencode.ai/workspace/wrk_Target9/usage");
   assert.equal(anchor.hidden, true);
+  assert.equal(anchorAttributes.get("link"), "");
   assert.deepEqual(actions, ["追加", "点击", "移除"]);
   assert.equal(gotoCalls, 0);
 });
