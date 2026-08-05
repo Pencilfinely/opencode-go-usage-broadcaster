@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config";
 import { CollectorDisabledError } from "../src/domain";
 import { createQuotaSource } from "../src/source";
+import { createUsageDetailsSource } from "../src/opencode-usage-source";
 
 const fixture = JSON.stringify({
   rollingUsage: { status: "ok", resetInSec: 3600, usagePercent: 49 },
@@ -43,7 +44,152 @@ function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
   } as Cloudflare.Env;
 }
 
+function makeV2SessionBundle(): string {
+  return JSON.stringify({
+    version: 2,
+    generation: "generation-v2",
+    createdAt: "2026-08-05T03:00:00.000Z",
+    workspaceId: "wrk_abc",
+    auth: { cookie: "auth=test-cookie" },
+    goRequest: {
+      url: "https://opencode.ai/workspace/wrk_abc/go",
+      method: "GET",
+      headers: { accept: "text/html" }
+    },
+    usageList: {
+      firstPage: {
+        url: "https://opencode.ai/_server?id=usage.list",
+        method: "POST",
+        headers: {
+          accept: "text/javascript",
+          "content-type": "application/json"
+        },
+        body: '["wrk_abc",0]'
+      },
+      pagination: {
+        mode: "paginated",
+        template: {
+          location: "body",
+          prefix: '["wrk_abc",',
+          suffix: "]"
+        }
+      }
+    }
+  });
+}
+
 describe("quota source boundary", () => {
+  it("版本 2 使用会话代次并可创建两类来源", async () => {
+    const config = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: makeV2SessionBundle()
+    }));
+    const usageSource = createUsageDetailsSource(config, async () => new Response("[]", {
+      headers: { "content-type": "application/json" }
+    }));
+
+    expect(config.authGeneration).toBe("generation-v2");
+    expect(createQuotaSource(config)).toBeDefined();
+    await expect(usageSource.fetch(Date.parse("2026-08-05T03:30:00.000Z"))).resolves.toEqual({
+      status: "complete",
+      records: [],
+      pagesRead: 1
+    });
+  });
+
+  it("版本 1 保持 Go 来源可用但明细来源降级", async () => {
+    const sessionBundle = JSON.stringify({
+      version: 1,
+      generation: "bundle-generation",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      workspaceId: "workspace-1",
+      auth: { cookie: "auth=session-value" },
+      request: {
+        url: "https://opencode.ai/workspace/workspace-1/go",
+        method: "GET",
+        headers: { accept: "text/html" }
+      }
+    });
+    const config = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: sessionBundle
+    }));
+
+    expect(createQuotaSource(config)).toBeDefined();
+    await expect(createUsageDetailsSource(config).fetch(Date.now())).resolves.toEqual({
+      status: "unavailable",
+      reason: "not-authorized"
+    });
+  });
+
+  it("fixture 与禁用控制台均创建不可用的明细来源", async () => {
+    const fixtureSource = createUsageDetailsSource(loadConfig(makeEnv()));
+    const disabledSource = createUsageDetailsSource(loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "false"
+    })));
+
+    await expect(fixtureSource.fetch(Date.now())).resolves.toEqual({
+      status: "unavailable",
+      reason: "not-authorized"
+    });
+    await expect(disabledSource.fetch(Date.now())).resolves.toEqual({
+      status: "unavailable",
+      reason: "not-authorized"
+    });
+  });
+
+  it("损坏的分页模板在网络请求前归类为结构错误", async () => {
+    const invalidBundle = JSON.stringify({
+      version: 2,
+      generation: "generation-v2",
+      createdAt: "2026-08-05T03:00:00.000Z",
+      workspaceId: "wrk_abc",
+      auth: { cookie: "auth=test-cookie" },
+      goRequest: {
+        url: "https://opencode.ai/workspace/wrk_abc/go",
+        method: "GET",
+        headers: { accept: "text/html" }
+      },
+      usageList: {
+        firstPage: {
+          url: "https://opencode.ai/_server?id=usage.list",
+          method: "POST",
+          headers: {
+            accept: "text/javascript",
+            "content-type": "application/json"
+          },
+          body: '["wrk_abc",0]'
+        },
+        pagination: {
+          mode: "paginated",
+          template: {
+            location: "body",
+            prefix: '["wrk_abc",',
+            suffix: "]损坏"
+          }
+        }
+      }
+    });
+    const config = loadConfig(makeEnv({
+      USAGE_SOURCE: "opencode-console",
+      OPENCODE_CONSOLE_ENABLED: "true",
+      OPENCODE_SESSION_BUNDLE: invalidBundle
+    }));
+    let fetchCalls = 0;
+    const source = createUsageDetailsSource(config, async () => {
+      fetchCalls += 1;
+      return new Response("[]", { headers: { "content-type": "application/json" } });
+    });
+
+    await expect(source.fetch(Date.parse("2026-08-05T03:30:00.000Z"))).rejects.toMatchObject({
+      kind: "schema"
+    });
+    expect(fetchCalls).toBe(0);
+  });
+
   it.each([
     ["缺失", undefined],
     ["少于 32 个字符", "too-short"]
