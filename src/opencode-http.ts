@@ -94,7 +94,7 @@ export async function replayOpenCodeRequest(
       }
       response = await fetchImpl(request.url, {
         method: request.method,
-        headers,
+        headers: Object.fromEntries(headers.entries()),
         ...(request.body === undefined ? {} : { body: request.body }),
         redirect: "manual",
         signal: controller.signal

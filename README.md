@@ -25,12 +25,13 @@
 
 ## 授权、分页与降级
 
-用量明细依赖 `OPENCODE_SESSION_BUNDLE`。授权工具会在临时浏览器配置文件中要求用户完成一次 GitHub 登录，然后依次捕获 `/go` 与 `/usage` 请求；结束后自动关闭浏览器并删除临时配置文件。
+用量明细依赖 `OPENCODE_SESSION_BUNDLE`。授权工具会在临时浏览器配置文件中要求用户完成一次 GitHub 登录，先捕获 `/go`，再从该页面通过站内导航进入 `/workspace/<工作区>/usage`，捕获页面发出的首个只读用量请求；结束后自动关闭浏览器并删除临时配置文件。
 
 - 旧的 V1 会话包没有 `usage.list` 分页授权信息，系统会将 24 小时明细降级为“尚未授权”，但三项额度广播继续发送。
-- 如果 V2 会话包只授权了单页，而首次 `/usage` 正好满 50 条，系统不会猜测下一页；会提示“分页尚未授权”，必须重新运行授权工具以捕获分页请求。
+- 如果 V2 会话包只授权了单页，而后续首次 `/usage` 正好满 50 条，系统不会把前 50 条冒充完整数据；会提示“分页尚未授权”，必须重新运行授权工具刷新授权包。
 - 采集最多读取 40 页，并有 25 秒总时限。达到任一上限会输出已采集记录的截断汇总（带“至少”），而不是阻断本次额度广播。
 - 登录失效、暂时网络问题或响应结构变化同样只会让明细降级；`/usage` 的失败不应阻断 `/go` 配额读取、额度消息创建或投递。
+- OpenCode 的服务函数编号来自当前网站构建，不是固定的 `usage.list` 字符串。上游重新构建后若编号变化，需重新运行授权工具；工具不会保存 GitHub 密码，也不会持久化浏览器的 `X-Server-*` 请求头。
 
 重新授权并且只创建新的 Worker 版本时，使用：
 
@@ -69,7 +70,7 @@ git diff --check
 1. 确认生产根地址为 `https://opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev`，预览 alias 根地址为 `https://usage-chart-opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev`。后续预览一律使用后者。
 2. 先对远程 D1 应用 migration，再安全地创建 `USAGE_CHART_SIGNING_SECRET`；随后运行 `npx wrangler versions upload --dry-run`。`wrangler versions secret put` 只创建新版本，不会移动 preview alias。
 3. 第一次上传必须带 `--preview-alias usage-chart`、预览 `PUBLIC_BASE_URL` 和预览标签。确认 alias 对外公开、没有 Cloudflare Access。
-4. 在同一 PowerShell 会话运行 `npm run auth:setup -- --version-only`，完成一次 GitHub 登录；工具依次访问 `/go`、`/usage`，捕获完成后关闭并清理临时 profile。两次上传之间暂停 CI 和其他发布。
+4. 在同一 PowerShell 会话运行 `npm run auth:setup -- --version-only`，完成一次 GitHub 登录；工具先访问 `/workspace/<工作区>/go`，再通过站内导航进入 `/workspace/<工作区>/usage`，捕获完成后关闭并清理临时 profile。两次上传之间暂停 CI 和其他发布。
 5. 再次执行 `npx wrangler versions upload --preview-alias usage-chart`，并再次传入预览 `PUBLIC_BASE_URL`，使 alias 移到含新会话包的版本；只核对最新版本 Secret 名称中含有 `OPENCODE_SESSION_BUNDLE` 与 `USAGE_CHART_SIGNING_SECRET`，不要读取或打印 Secret 值。
 6. 仅向预览 alias 的 `/admin/manual-trigger` 发起一次带安全输入的 `MANUAL_TRIGGER_SECRET` 和唯一幂等键的请求，确认响应为 204。不要用 GitHub 生产工作流替代该验收。
 7. 在微信打开本次 PushPlus 详情，确认三项额度、24 小时文字汇总、模型排行和 SVG 都可见。若 SVG 不可见，停止生产发布，保留预览版本并回到设计决策；不要临时接入第三方图表，也不要声称验收通过。
