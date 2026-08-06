@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { OpenCodeConsoleQuotaSource } from "../src/source";
-import type { OpenCodeSessionBundleV1 } from "../src/opencode-session";
+import {
+  parseOpenCodeGoResponse,
+  type OpenCodeSessionBundleV1
+} from "../src/opencode-session";
 
 function bundle(
   overrides: Partial<OpenCodeSessionBundleV1["request"]> = {}
@@ -21,6 +24,10 @@ function bundle(
 }
 
 describe("OpenCode 控制台采集器", () => {
+  it("保留 Go 页面 JSON 响应解析", () => {
+    expect(parseOpenCodeGoResponse('{"answer":42}')).toEqual({ answer: 42 });
+  });
+
   it("将嵌套响应中的三个用量窗口规范化为快照", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(Response.json({
       result: {
@@ -151,6 +158,34 @@ describe("OpenCode 控制台采集器", () => {
 
     await expect(source.fetch(new Date())).rejects.toMatchObject({
       kind: "auth"
+    });
+  });
+
+  it.each([301, 303])("将 %s 重定向归类为认证错误", async (status) => {
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(null, {
+        status,
+        headers: { location: "/workspace/workspace-1/go" }
+      }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "auth"
+    });
+  });
+
+  it("将 308 重定向归类为瞬态错误", async () => {
+    const source = new OpenCodeConsoleQuotaSource(
+      bundle(),
+      vi.fn().mockResolvedValue(new Response(null, {
+        status: 308,
+        headers: { location: "/workspace/workspace-1/go" }
+      }))
+    );
+
+    await expect(source.fetch(new Date())).rejects.toMatchObject({
+      kind: "transient"
     });
   });
 

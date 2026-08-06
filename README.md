@@ -1,149 +1,99 @@
-# OpenCode Go 用量广播器
+# OpenCode Go 用量广播
 
-这是一个 Cloudflare Worker：按计划读取 OpenCode Go 用量，使用 D1 去重和保留状态，并通过 PushPlus 私人主题发送通知。
+这是一个 Cloudflare Worker：在北京时间 09:00 至 23:00 的整点读取 OpenCode Go 用量，并通过 PushPlus 向指定主题发送通知。通知包含三项额度，以及在授权可用时生成的最近 24 小时用量明细、模型排行和签名 SVG 图表。
 
-## 架构与计划
+## 广播内容与顺序
 
-Worker 在北京时间每日 09:00 至 23:00 的每个整点广播当前用量，00:00 至 08:59 保持静默。定时任务从来源读取滚动、周和月三个用量窗口；D1 负责快照版本、任务去重和待投递消息；PushPlus 负责投递及签名回调。PushPlus 接口接受消息后即视为投递成功，不再因回调缺失而重复发送。
+整点广播（手动触发时标题相应变为“手动用量”）的正文按下面顺序输出；各行由 PushPlus 的换行分隔：
 
-默认配置保持 `USAGE_SOURCE=fixture` 与 `OPENCODE_CONSOLE_ENABLED=false`。夹具消息会显示“【测试数据】”，便于避免将演示数据误当成真实数据。
+1. 5 小时额度（百分比和重置时间）。
+2. 每周额度（百分比和重置时间）。
+3. 每月额度（百分比和重置时间）。
+4. 最近 24 小时明细：请求数、总 Token、四类 Token、费用、模型排行、图表或图表降级说明；若明细不可用，则在这里说明原因和下一步。
+5. 观察时间。
+6. “当前小时为部分小时，仅统计至观察时间”的口径说明。
+7. 事件号。
 
-## 前置条件
+明细成功时，模型排行显示前五个模型；其余模型合并为“其他”。如果采集在限制内没有完成，数值会以“至少”标识，图表也只代表已经采集到的最新记录。
 
-- Node.js 22 或更高版本。
-- Cloudflare 账号，以及已完成的 Wrangler 登录。
-- GitHub CLI，以及已完成的仓库登录。
-- PushPlus 账号和私人主题。
-- 用于 PushPlus 回调的公开 Worker HTTPS 地址。
-- 仅当启用真实采集时，需在 PC 上进行一次人工授权，并安装可被 Playwright 调用的 Chrome 或 Edge。
+## 24 小时、Token 与费用口径
 
-PushPlus 是服务号向私人主题投递消息；它不是在普通个人微信群中发言的机器人。请创建私人主题并仅让预期成员订阅，不要公开其二维码或主题信息。
+- 窗口以北京时间整点对齐，含当前小时在内共 24 个小时桶；当前小时是部分小时，截止于本次观察时间。
+- 四类 Token 为输入、输出、推理和缓存。缓存 Token 等于缓存读取、5 分钟缓存写入和 1 小时缓存写入之和；总 Token 为四类 Token 之和。
+- 请求数、费用和模型排行只统计窗口内、观察时间之前的记录。费用使用 OpenCode 返回的 `cost`，其单位为微美分（microcents），显示时按 `cost / 100000000` 换算为美元，并保留四位小数。
+- D1 不保存逐条用量明细、Cookie 或授权包。图表快照只保存已聚合的 24 个小时桶及观察信息，供对应的 SVG 链接读取；快照在创建 30 天后分批清理。
 
-## 本地检查与夹具演示
+## 授权、分页与降级
+
+用量明细依赖 `OPENCODE_SESSION_BUNDLE`。默认授权流程会在临时浏览器配置文件中要求用户完成一次 GitHub 登录，先从新建空白页捕获 `/go`，再通过站内导航进入 `/workspace/<工作区>/usage`，捕获页面发出的首个只读用量请求；结束后自动关闭浏览器并删除临时配置文件。
+
+可通过 `--profile` 使用一个专用的持久浏览器资料目录。首次使用的新目录或缺少 OpenCode 登录 Cookie 的旧目录会打开登录页，要求完成一次 GitHub 登录并进入工作区；工具会等到新的登录 Cookie 出现后再继续，结束后保留该目录。以后使用同一目录时，只要 OpenCode 登录状态仍有效，工具就会直接复用而不再打开登录页。工具始终不会删除调用方提供的目录；它会优先使用 `--workspace` 指定的工作区，否则只从恢复出的现有工作区页面识别。该目录可能包含 GitHub 和 OpenCode 登录 Cookie，应只保存在当前用户可访问的位置，不得提交、共享或写入日志。
+
+- 旧的 V1 会话包没有 `usage.list` 分页授权信息，系统会将 24 小时明细降级为“尚未授权”，但三项额度广播继续发送。
+- 如果 V2 会话包只授权了单页，而后续首次 `/usage` 正好满 50 条，系统不会把前 50 条冒充完整数据；会提示“分页尚未授权”，必须重新运行授权工具刷新授权包。
+- 采集最多读取 40 页，并有 25 秒总时限。达到任一上限会输出已采集记录的截断汇总（带“至少”），而不是阻断本次额度广播。
+- 登录失效、暂时网络问题或响应结构变化同样只会让明细降级；`/usage` 的失败不应阻断 `/go` 配额读取、额度消息创建或投递。
+- OpenCode 的服务函数编号来自当前网站构建，不是固定的 `usage.list` 字符串。上游重新构建后若编号变化，需重新运行授权工具；工具不会保存 GitHub 密码，也不会持久化浏览器的 `X-Server-*` 请求头。
+
+重新授权并且只创建新的 Worker 版本时，使用：
+
+```powershell
+npm run auth:setup -- --version-only
+```
+
+首次创建或以后复用持久登录资料时，使用：
+
+```powershell
+npm run auth:setup -- --profile "C:\安全位置\opencode-browser-profile" --workspace "wrk_Abc123" --version-only
+```
+
+请把示例中的 `wrk_Abc123` 替换为真实工作区 ID；该参数仅接受 `wrk_` 加字母或数字。首次创建该目录时仍需在打开的浏览器中登录一次并进入任一工作区。如果资料恢复后只有一个工作区，可以省略 `--workspace`；已有登录状态但无法识别工作区或同时识别出多个工作区时，工具会立即停止并提示补充参数。
+
+该模式把新会话包写入最新 Worker 版本的 `OPENCODE_SESSION_BUNDLE`，不会移动 preview alias，也不会发布生产版本。完成该命令后，仍须重新执行带 `--preview-alias usage-chart` 的版本上传，才能让预览 alias 指向含新会话包的版本。
+
+## 本地准备与检查
+
+需要 Node.js 22 或更高版本，以及已登录的 Cloudflare 和 GitHub CLI（仅部署或创建 PR 时需要）。安装依赖并运行完整本地检查：
 
 ```powershell
 npm ci
 Copy-Item .dev.vars.example .dev.vars
 npm run check
+git diff --check
 ```
 
-示例变量均为不可用占位值。`.dev.vars` 仅供本机使用，不能提交；不要在其中保存 OpenCode 会话。
+`.dev.vars` 只用于本地开发，绝不提交。不要把生产 Secret、Cookie、完整会话授权包或签名 URL 写入 README、日志、截图、issue、PR 或配置样例。
 
-夹具演示在配置了真实 PushPlus Secret 时会真的投递消息。请先选择私人测试主题，再启动 Worker：
+## 图表配置与访问范围
+
+新增的两个配置项如下：
+
+- `PUBLIC_BASE_URL`：图表公开读取所用的 HTTPS 根地址，只能是 origin，不能带路径、查询参数、用户信息或非标准端口。生产值应是生产 Worker 根地址；预览上传时必须改为预览 alias 根地址。
+- `USAGE_CHART_SIGNING_SECRET`：至少 32 个字符的独立 Secret，用 HMAC-SHA-256 为图表快照编号签名。它必须在第一次图表版本上传之前写入 Worker Secret，绝不写入文件或回显。
+
+每条广播生成的图表 URL 是一个带签名的 SVG 链接。Worker 只接受 `GET`、精确路径和签名参数，并拒绝带 Cookie 或 `Authorization` 的请求；因此它不是账户登录页，但任何拿到完整签名链接的人都可在快照保留期内查看该图表。链接只包含聚合图表数据，不含原始记录或会话凭据。预览 alias 必须公开，且不能启用 Cloudflare Access，否则微信客户端无法匿名读取 SVG。
+
+## 严格的预览验收顺序
+
+以下是远程操作说明，必须按顺序执行；本地检查不能替代这些门槛。命令中的 Secret 均通过安全输入或临时变量提供，不能用真实值替换后保存到任何文件。
+
+1. 确认生产根地址为 `https://opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev`，预览 alias 根地址为 `https://usage-chart-opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev`。后续预览一律使用后者。
+2. 先对远程 D1 应用 migration，再安全地创建 `USAGE_CHART_SIGNING_SECRET`；随后运行 `npx wrangler versions upload --dry-run`。`wrangler versions secret put` 只创建新版本，不会移动 preview alias。
+3. 第一次上传必须带 `--preview-alias usage-chart`、预览 `PUBLIC_BASE_URL` 和预览标签。确认 alias 对外公开、没有 Cloudflare Access。
+4. 在同一 PowerShell 会话运行 `npm run auth:setup -- --version-only`，完成一次 GitHub 登录；若希望保存并在以后复用登录状态，则改用上面的 `--profile` 命令。工具从新建空白页访问 `/workspace/<工作区>/go`，再通过站内导航进入 `/workspace/<工作区>/usage`。默认临时 profile 会被清理，调用方提供的 profile 会保留。两次上传之间暂停 CI 和其他发布。
+5. 再次执行 `npx wrangler versions upload --preview-alias usage-chart`，并再次传入预览 `PUBLIC_BASE_URL`，使 alias 移到含新会话包的版本；只核对最终 alias 版本的 Secret 名称完整包含 `PUSHPLUS_TOKEN`、`PUSHPLUS_TOPIC`、`PUSHPLUS_CALLBACK_SECRET`、`PUSHPLUS_CALLBACK_BASE_URL`、`MANUAL_TRIGGER_SECRET`、`OPENCODE_SESSION_BUNDLE` 与 `USAGE_CHART_SIGNING_SECRET`，不要读取或打印 Secret 值。
+6. 仅向预览 alias 的 `/admin/manual-trigger` 发起一次带安全输入的 `MANUAL_TRIGGER_SECRET` 和唯一幂等键的请求，确认响应为 204。不要用 GitHub 生产工作流替代该验收。
+7. 在微信打开本次 PushPlus 详情，确认三项额度、24 小时文字汇总、模型排行和 SVG 都可见。若 SVG 不可见，停止生产发布，保留预览版本并回到设计决策；不要临时接入第三方图表，也不要声称验收通过。
+8. 只有上述微信门槛通过后，才推送分支并创建中文、非草稿 PR。PR 只能陈述实际完成的验证；合并后再在主分支运行 `npm run check` 与生产部署，并观察下一个北京时间整点。
+
+## 生产运行说明
+
+生产配置保持 `PUBLIC_BASE_URL` 为生产根地址，Cron 为 `0 1-15 * * *`（UTC），即北京时间每日 09:00 至 23:00。手动触发、定时广播和三项额度仍沿用原有规则；新增明细和图表始终是可降级的附加内容。
+
+本地启动开发服务：
 
 ```powershell
 npm run dev
 ```
 
-从另一个 PowerShell 窗口触发整点任务：
-
-```powershell
-curl.exe --get --data-urlencode "cron=0 1-15 * * *" --data-urlencode "format=json" "http://localhost:8787/cdn-cgi/handler/scheduled"
-```
-
-## 首次部署顺序
-
-以下是操作顺序，不代表这些外部步骤已经完成。
-
-1. 登录 Cloudflare：`npx wrangler login`。
-2. 创建并迁移 D1：
-
-   ```powershell
-   npx wrangler d1 create opencode-go-usage --binding DB --update-config
-   npx wrangler d1 migrations apply opencode-go-usage --remote
-   ```
-
-   确认 Wrangler 只替换了 `wrangler.jsonc` 中全零的 `database_id`；若未自动替换，只手动填入该字段返回的 ID。
-3. 保持 `USAGE_SOURCE=fixture` 与 `OPENCODE_CONSOLE_ENABLED=false`，首次部署以创建 Worker 并取得 HTTPS origin：
-
-   ```powershell
-   npm run deploy
-   ```
-
-   在 Worker 已创建、但所需 Secret 尚未设置的短暂窗口内，定时调用可能因缺少 Secret 产生错误；请立即完成下一步。此时仍为夹具来源，不会读取真实 OpenCode 会话。
-4. 交互式设置 PushPlus 与手动触发 Secret。Secret 保存在 Cloudflare Worker 的 Secret 存储中，而不在仓库、D1 或 `wrangler.jsonc`：
-
-   ```powershell
-   npx wrangler secret put PUSHPLUS_TOKEN
-   npx wrangler secret put PUSHPLUS_TOPIC
-   npx wrangler secret put PUSHPLUS_CALLBACK_SECRET
-   npx wrangler secret put PUSHPLUS_CALLBACK_BASE_URL
-   ```
-
-   `PUSHPLUS_CALLBACK_BASE_URL` 必须使用上一步取得的 origin，格式严格为 `https://<worker-host>`，不含路径、查询或片段。回调密钥与 `MANUAL_TRIGGER_SECRET` 均至少 32 个字符；回调密钥可由密码管理器生成后在 Wrangler 提示中直接粘贴。
-
-   手动触发密钥必须让 Cloudflare Worker 与 GitHub Actions 使用同一个值。以下 PowerShell 在当前进程内生成随机值，再分别通过标准输入同步到两个 Secret 存储；密钥不会进入文件、命令参数或日志，也不会在终端回显：
-
-   ```powershell
-   $manualSecretBytes = [byte[]]::new(32)
-   [Security.Cryptography.RandomNumberGenerator]::Fill($manualSecretBytes)
-   $manualTriggerSecret = [Convert]::ToHexString($manualSecretBytes).ToLowerInvariant()
-
-   $manualTriggerSecret | npx wrangler secret put MANUAL_TRIGGER_SECRET
-   if ($LASTEXITCODE -ne 0) { throw 'Cloudflare 手动触发密钥同步失败。' }
-
-   $manualTriggerSecret | gh secret set MANUAL_TRIGGER_SECRET
-   if ($LASTEXITCODE -ne 0) { throw 'GitHub 手动触发密钥同步失败。' }
-
-   [Array]::Clear($manualSecretBytes, 0, $manualSecretBytes.Length)
-   $manualTriggerSecret = $null
-   ```
-
-   程序每次投递都会自动附带包含事件 ID、过期时间与签名的完整回调 URL；无需在 PushPlus 单独配置固定回调地址。
-5. 运行授权工具，在其打开的浏览器中人工完成 GitHub 登录并进入目标工作区即可；工具会自动打开用量页、校验结果并上传会话，不需要手动进入 Go/Usage 页面、捕获 `_server` 响应或在终端按回车：
-
-   ```powershell
-   npm run auth:setup
-   ```
-
-   工具会验证用量请求后，直接通过标准输入上传 `OPENCODE_SESSION_BUNDLE` 到 Cloudflare Secret；会话不进入文件、命令参数、D1、日志或 Git。
-6. 确认夹具部署和 PushPlus 投递可用后，才将 `USAGE_SOURCE` 改为 `opencode-console`、将 `OPENCODE_CONSOLE_ENABLED` 改为 `true`，并最终部署：
-
-   ```powershell
-   npm run deploy
-   ```
-
-`OPENCODE_SESSION_BUNDLE` 已列为部署所需 Secret，但示例文件和版本控制中不会包含它或任何 Cookie 内容。
-
-## GitHub 手动广播
-
-手动广播不受夜间静默时段限制。先把与 Cloudflare Worker 相同的 `MANUAL_TRIGGER_SECRET` 保存为仓库的 GitHub Actions Secret；不要把该值写入文件、命令参数或日志。随后打开仓库的“Actions”页面，选择“手动发送 OpenCode Go 用量”，点击“Run workflow”即可。工作流会用本次运行编号生成幂等键，并调用生产 Worker 的安全入口；同一次运行重试不会重复创建广播。
-
-## 真实来源、会话续期与回退
-
-真实来源依赖当前 OpenCode 控制台的内部协议，可能随时变化。请持续关注 [OpenCode issue 16017](https://github.com/anomalyco/opencode/issues/16017) 和尚未合并的 [PR 16513](https://github.com/anomalyco/opencode/pull/16513)。
-
-若通知显示登录失效，或真实采集返回认证故障，请重新运行 `npm run auth:setup` 完成人工 GitHub 登录并上传新会话，然后再次部署真实来源。会话更新会产生新的授权代次并允许一次恢复探测。
-
-若要停止真实采集，立即将 `USAGE_SOURCE` 改回 `fixture`，将 `OPENCODE_CONSOLE_ENABLED` 改回 `false` 后部署。需要彻底撤销授权时，在 Cloudflare 删除 `OPENCODE_SESSION_BUNDLE`，并在 OpenCode/GitHub 侧撤销相应会话；Worker 仍可用夹具继续验证投递链路。
-
-## 故障分类
-
-- 认证故障：会话过期、401、403 或登录跳转。重新运行 `npm run auth:setup`。
-- 暂时故障：网络超时、429、408 或 5xx。任务会有限重试；稍后检查 OpenCode 服务状态。
-- 格式故障：响应结构不符合预期，通常意味着内部协议变更。停止真实来源并等待适配更新。
-- 采集器禁用：`USAGE_SOURCE=opencode-console` 但开关未启用时会安全跳过，不发起真实网络请求。
-
-## 发布前检查
-
-仅在完成预定改动后运行一次：
-
-```powershell
-npm run check
-```
-
-再执行以下扫描。无匹配时 `git grep` 返回 1，脚本会将其视为成功；历史计划文件因包含经审阅的扫描字面量而被精确排除。
-
-```powershell
-$credentialPattern = '(' + 'g' + 'hp_|github' + '_pat_|\bsk-[A-Za-z0-9]|Cookie' + ':|Set-Cookie' + ':)'
-$scanOutput = & git grep -n -I -E $credentialPattern -- ':!docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md'
-if ($LASTEXITCODE -ne 1 -or $scanOutput) { $scanOutput; throw '凭据样式扫描失败。' }
-```
-
-```powershell
-$todoPattern = '(' + 'TO' + 'DO|TB' + 'D)'
-$todoOutput = & git grep -n -I -E $todoPattern -- ':!docs/superpowers/plans/2026-08-03-opencode-go-usage-broadcaster-mvp.md'
-if ($LASTEXITCODE -ne 1 -or $todoOutput) { $todoOutput; throw '占位标记扫描失败。' }
-```
-
-消息最多尝试投递三次。整点与手动广播会在下一个上海整点过期；故障与恢复消息在 24 小时后过期。
+不要在本地或生产配置中留下真实的 `OPENCODE_SESSION_BUNDLE`、Cookie、图表签名、PushPlus 凭据或任何授权包。

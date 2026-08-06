@@ -4,6 +4,11 @@ import {
   type UsageWindow,
   type WindowKey
 } from "./domain";
+import type {
+  UsageDetailsView,
+  UsageModelTotal,
+  UsageUnavailableReason
+} from "./usage-domain";
 
 export const THRESHOLDS = [50, 75, 90, 100] as const;
 export type Threshold = (typeof THRESHOLDS)[number];
@@ -164,6 +169,87 @@ function prefix(snapshot: QuotaSnapshot): string {
   return snapshot.source === "fixture" ? "【测试数据】" : "";
 }
 
+function escapeHtmlText(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+const escapeHtmlAttribute = escapeHtmlText;
+
+const USAGE_UNAVAILABLE_COPY: Record<UsageUnavailableReason, string> = {
+  "not-authorized": "24 小时明细尚未授权，请重新运行授权工具。",
+  "single-page-full": "24 小时明细分页尚未授权，请重新运行授权工具。",
+  auth: "24 小时明细登录已失效，请重新运行授权工具。",
+  transient: "24 小时明细暂时不可用，本次额度数据不受影响。",
+  schema: "24 小时明细格式已变化，请更新采集适配器。"
+};
+
+const numberFormat = new Intl.NumberFormat("zh-CN", {
+  maximumFractionDigits: 0
+});
+
+function formatInteger(value: number): string {
+  return numberFormat.format(value);
+}
+
+function formatQualified(value: string, truncated: boolean): string {
+  return truncated ? "至少 " + value : value;
+}
+
+function formatModels(models: UsageModelTotal[], truncated: boolean): string {
+  if (models.length === 0) return "暂无模型记录";
+  return models.map((model) =>
+    escapeHtmlText(model.model) +
+    "：" +
+    formatQualified(formatInteger(model.tokenCount), truncated) +
+    " Token（" +
+    formatQualified(model.sharePercent.toFixed(1) + "%", truncated) +
+    "）"
+  ).join("；");
+}
+
+function renderUsageDetails(usageDetails: UsageDetailsView): string[] {
+  if (usageDetails.status === "unavailable") {
+    return [USAGE_UNAVAILABLE_COPY[usageDetails.reason]];
+  }
+  const aggregate = usageDetails.aggregate;
+  const rows = [
+    "最近 24 小时请求数：" +
+      formatQualified(formatInteger(aggregate.requestCount), aggregate.truncated),
+    "最近 24 小时总 Token：" +
+      formatQualified(formatInteger(aggregate.tokens.totalTokens), aggregate.truncated),
+    "Token 分类：输入 " +
+      formatQualified(formatInteger(aggregate.tokens.inputTokens), aggregate.truncated) +
+      "；输出 " +
+      formatQualified(formatInteger(aggregate.tokens.outputTokens), aggregate.truncated) +
+      "；推理 " +
+      formatQualified(formatInteger(aggregate.tokens.reasoningTokens), aggregate.truncated) +
+      "；缓存 " +
+      formatQualified(formatInteger(aggregate.tokens.cacheTokens), aggregate.truncated),
+    "费用：" +
+      formatQualified(
+        "$" + (aggregate.costMicroCents / 100000000).toFixed(4),
+        aggregate.truncated
+      ),
+    "模型排行：" + formatModels(aggregate.models, aggregate.truncated)
+  ];
+  if (usageDetails.chartUrl) {
+    rows.push(
+      '<img src="' +
+        escapeHtmlAttribute(usageDetails.chartUrl) +
+        '" alt="最近 24 小时 Token 分层图" style="max-width:100%;height:auto">'
+    );
+  } else {
+    rows.push("图表暂不可用，文字汇总不受影响。");
+  }
+  if (aggregate.truncated) rows.push("图表仅含已采集的最新记录。");
+  return rows;
+}
+
 export function renderThresholdMessage(
   snapshot: QuotaSnapshot,
   items: ThresholdItem[],
@@ -228,12 +314,37 @@ export function renderSummaryMessage(
 export function renderBroadcastMessage(
   snapshot: QuotaSnapshot,
   eventId: string,
-  manual: boolean
+  manual: boolean,
+  usageDetails: UsageDetailsView = {
+    status: "unavailable",
+    reason: "not-authorized"
+  }
 ): RenderedMessage {
+  const quotaRows = WINDOW_KEYS.map((key) => {
+    const value = snapshot.windows[key];
+    return (
+      WINDOW_LABELS[key] +
+      ": " +
+      value.usedPercent +
+      "%（重置 " +
+      formatReset(value.resetAt) +
+      "）"
+    );
+  });
+  const observedAt = formatReset(snapshot.observedAt);
   return {
-    ...renderSummaryMessage(snapshot, eventId, false),
     title: prefix(snapshot) +
-      (manual ? "OpenCode Go 手动用量" : "OpenCode Go 整点用量")
+      (manual ? "OpenCode Go 手动用量" : "OpenCode Go 整点用量"),
+    content:
+      prefix(snapshot) +
+      quotaRows
+        .concat(renderUsageDetails(usageDetails))
+        .concat([
+          "观察时间：" + observedAt,
+          "当前小时为部分小时，仅统计至观察时间。",
+          "事件：" + escapeHtmlText(eventId)
+        ])
+        .join("<br>")
   };
 }
 

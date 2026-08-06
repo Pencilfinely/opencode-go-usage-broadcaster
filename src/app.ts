@@ -8,9 +8,11 @@ import {
 } from "./domain";
 import { dispatchDue } from "./pushplus";
 import {
+  LeaseLostError,
   Repository,
   type EventKind,
-  type NewOutboxEvent
+  type NewOutboxEvent,
+  type UsageChartSnapshotWrite
 } from "./repository";
 import {
   evaluateSnapshot,
@@ -21,6 +23,17 @@ import {
   type ThresholdItem
 } from "./rules";
 import { createQuotaSource } from "./source";
+import { aggregateUsage24h } from "./usage-aggregate";
+import {
+  createUsageChartUrl,
+  serializeUsageChartData
+} from "./usage-chart";
+import type {
+  UsageDetailsSource,
+  UsageDetailsView,
+  UsageUnavailableReason
+} from "./usage-domain";
+import { createUsageDetailsSource } from "./opencode-usage-source";
 
 export interface FaultEpisode {
   id: string;
@@ -43,6 +56,7 @@ export interface RuntimeState {
 
 export interface AppDeps {
   source?: QuotaSource;
+  usageSource?: UsageDetailsSource;
   fetchImpl?: typeof fetch;
   sourceFetchImpl?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
@@ -176,12 +190,12 @@ async function deterministicEventId(logicalKey: string): Promise<string> {
 async function newEvent(
   kind: EventKind,
   logicalKey: string,
-  render: (eventId: string) => RenderedMessage,
+  render: (eventId: string) => RenderedMessage | Promise<RenderedMessage>,
   notAfter: number,
   triggers: ThresholdItem[]
 ): Promise<NewOutboxEvent> {
   const id = await deterministicEventId(logicalKey);
-  const rendered = render(id);
+  const rendered = await render(id);
   return {
     id,
     logicalKey,
@@ -349,9 +363,15 @@ export async function runBroadcast(
     config,
     deps.sourceFetchImpl ?? fetch
   );
+  const usageSource = deps.usageSource ?? createUsageDetailsSource(
+    config,
+    deps.sourceFetchImpl,
+    clock
+  );
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? defaultSleep;
 
+  try {
   if (scheduledNotAfter !== undefined && clock() >= scheduledNotAfter) {
     return "completed";
   }
@@ -402,7 +422,8 @@ export async function runBroadcast(
           jobStatus: "skipped",
           errorKind: "stale-slot",
           states: [],
-          events: []
+          events: [],
+          usageChartSnapshots: []
         });
         return "completed";
       }
@@ -434,7 +455,8 @@ export async function runBroadcast(
           jobStatus: isScheduled ? "skipped" : "failed",
           errorKind: "auth-blocked",
           states: [{ key: "runtime", value: runtime, version: now }],
-          events
+          events,
+          usageChartSnapshots: []
         });
         return isScheduled ? "completed" : "failed";
       }
@@ -459,7 +481,8 @@ export async function runBroadcast(
             jobStatus: "skipped",
             errorKind,
             states: [{ key: "runtime", value: runtime, version: now }],
-            events
+            events,
+            usageChartSnapshots: []
           });
           return isScheduled ? "completed" : "failed";
         }
@@ -541,7 +564,8 @@ export async function runBroadcast(
           jobStatus: "failed",
           errorKind,
           states: [{ key: "runtime", value: runtime, version: now }],
-          events
+          events,
+          usageChartSnapshots: []
         });
         return isScheduled ? "completed" : "failed";
       }
@@ -556,28 +580,59 @@ export async function runBroadcast(
           jobStatus: "skipped",
           errorKind: "stale-slot",
           states: [{ key: "runtime", value: runtime, version: now }],
-          events: []
+          events: [],
+          usageChartSnapshots: []
         });
         return "completed";
       }
 
       const evaluation = evaluateSnapshot(previousQuota, snapshot, observedAt);
-      const events: NewOutboxEvent[] = [];
+      let usageView: UsageDetailsView;
+      try {
+        const collected = await usageSource.fetch(observedAt);
+        usageView = collected.status === "unavailable"
+          ? { status: "unavailable", reason: collected.reason }
+          : {
+              status: "available",
+              aggregate: aggregateUsage24h(
+                collected.records,
+                observedAt,
+                collected.status === "truncated"
+              )
+            };
+      } catch (error) {
+        const reason: UsageUnavailableReason =
+          error instanceof SourceError &&
+          (
+            error.kind === "auth" ||
+            error.kind === "transient" ||
+            error.kind === "schema"
+          )
+            ? error.kind
+            : "transient";
+        usageView = { status: "unavailable", reason };
+      }
 
-      const logicalKey = broadcastLogicalKey(trigger);
-      const targetEvent = await newEvent(
-        "daily",
-        logicalKey,
-        (eventId) => renderBroadcastMessage(
-          snapshot,
-          eventId,
-          trigger.type === "manual"
-        ),
-        scheduledNotAfter ?? nextShanghaiHour(scheduledAt),
-        []
-      );
-      events.push(targetEvent);
+      now = clock();
+      if (scheduledNotAfter !== undefined && now >= scheduledNotAfter) {
+        runtime.version = scheduledAt;
+        await repo.commitSnapshotUnderLease({
+          owner,
+          now,
+          jobKey,
+          jobStatus: "skipped",
+          errorKind: "expired-slot",
+          states: [
+            { key: "quota", value: evaluation.state, version: now },
+            { key: "runtime", value: runtime, version: now }
+          ],
+          events: [],
+          usageChartSnapshots: []
+        });
+        return "completed";
+      }
 
+      const recoveryEvents: NewOutboxEvent[] = [];
       if (isScheduled) {
         const prefix = fixturePrefix(config.sourceName);
         for (const faultKind of FAULT_KINDS) {
@@ -587,7 +642,7 @@ export async function runBroadcast(
             episode.warningCreated &&
             await repo.isEventSucceeded(episode.warningEventId)
           ) {
-            events.push(await faultEvent(
+            recoveryEvents.push(await faultEvent(
               faultKind,
               episode.id,
               "recovery",
@@ -601,17 +656,88 @@ export async function runBroadcast(
         runtime.version = scheduledAt;
       }
 
-      await repo.commitSnapshotUnderLease({
+      const logicalKey = broadcastLogicalKey(trigger);
+      const manual = trigger.type === "manual";
+      const notAfter = scheduledNotAfter ?? nextShanghaiHour(scheduledAt);
+      const textOnlyEvent = await newEvent(
+        "daily",
+        logicalKey,
+        (eventId) => renderBroadcastMessage(
+          snapshot,
+          eventId,
+          manual,
+          usageView
+        ),
+        notAfter,
+        []
+      );
+      let targetEvent = textOnlyEvent;
+      let usageChartSnapshots: UsageChartSnapshotWrite[] = [];
+      if (usageView.status === "available") {
+        try {
+          const chartUrl = await createUsageChartUrl(
+            config.usageChart,
+            textOnlyEvent.id
+          );
+          const richUsageView: UsageDetailsView = {
+            status: "available",
+            aggregate: usageView.aggregate,
+            chartUrl
+          };
+          targetEvent = await newEvent(
+            "daily",
+            logicalKey,
+            (eventId) => renderBroadcastMessage(
+              snapshot,
+              eventId,
+              manual,
+              richUsageView
+            ),
+            notAfter,
+            []
+          );
+          usageChartSnapshots = [{
+            id: targetEvent.id,
+            observedAt: usageView.aggregate.observedAt,
+            chartJson: serializeUsageChartData(usageView.aggregate),
+            createdAt: clock()
+          }];
+        } catch {
+          targetEvent = textOnlyEvent;
+          usageChartSnapshots = [];
+        }
+      }
+
+      const commitNow = clock();
+      const commonCommit = {
         owner,
-        now,
+        now: commitNow,
         jobKey,
-        jobStatus: "succeeded",
+        jobStatus: "succeeded" as const,
         states: [
-          { key: "quota", value: evaluation.state, version: now },
-          { key: "runtime", value: runtime, version: now }
-        ],
-        events
-      });
+          { key: "quota", value: evaluation.state, version: commitNow },
+          { key: "runtime", value: runtime, version: commitNow }
+        ]
+      };
+      try {
+        await repo.commitSnapshotUnderLease({
+          ...commonCommit,
+          events: [...recoveryEvents, targetEvent],
+          usageChartSnapshots
+        });
+      } catch (error) {
+        if (
+          error instanceof LeaseLostError ||
+          usageChartSnapshots.length === 0
+        ) {
+          throw error;
+        }
+        await repo.commitSnapshotUnderLease({
+          ...commonCommit,
+          events: [...recoveryEvents, textOnlyEvent],
+          usageChartSnapshots: []
+        });
+      }
       const report = await dispatchDue(
         repo,
         config.pushplus,
@@ -641,6 +767,19 @@ export async function runBroadcast(
   } finally {
     if (!dispatchedAfterCommit) {
       await dispatchDue(repo, config.pushplus, clock, fetchImpl);
+    }
+  }
+  } finally {
+    try {
+      await repo.deleteExpiredUsageChartSnapshots(
+        clock() - 30 * DAY_MS,
+        200
+      );
+    } catch {
+      console.warn(JSON.stringify({
+        stage: "用量图表快照清理",
+        category: "存储"
+      }));
     }
   }
 }

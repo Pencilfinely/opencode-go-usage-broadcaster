@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { QuotaSnapshot } from "../src/domain";
-import { evaluateSnapshot, renderThresholdMessage } from "../src/rules";
+import type { UsageAggregate } from "../src/usage-domain";
+import {
+  evaluateSnapshot,
+  renderBroadcastMessage,
+  renderThresholdMessage
+} from "../src/rules";
 
 function snapshot(
   rolling: number,
@@ -16,6 +21,26 @@ function snapshot(
       weekly: { status: "ok", usedPercent: weekly, resetAt },
       monthly: { status: "ok", usedPercent: monthly, resetAt }
     }
+  };
+}
+
+function aggregate(overrides: Partial<UsageAggregate> = {}): UsageAggregate {
+  return {
+    observedAt: Date.parse("2026-08-05T03:30:00.000Z"),
+    windowStartAt: Date.parse("2026-08-04T04:00:00.000Z"),
+    truncated: false,
+    requestCount: 0,
+    costMicroCents: 0,
+    tokens: {
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cacheTokens: 0,
+      totalTokens: 0
+    },
+    buckets: [],
+    models: [],
+    ...overrides
   };
 }
 
@@ -123,5 +148,47 @@ describe("quota rules", () => {
     expect(message.content).toContain(
       "threshold:rolling:reset:2026-08-03T06:00:00.000Z:90"
     );
+  });
+
+  it("转义模型名并以至少标识截断汇总", () => {
+    const message = renderBroadcastMessage(snapshot(49, 20, 10), "event-1", false, {
+      status: "available",
+      aggregate: aggregate({
+        truncated: true,
+        requestCount: 7,
+        costMicroCents: 123456789,
+        tokens: {
+          inputTokens: 10,
+          outputTokens: 20,
+          reasoningTokens: 3,
+          cacheTokens: 15,
+          totalTokens: 48
+        },
+        models: [{ model: "<img src=x>", tokenCount: 48, sharePercent: 100 }]
+      })
+    });
+
+    expect(message.content).toContain("&lt;img src=x&gt;");
+    expect(message.content).not.toContain("<img src=x>");
+    expect(message.content).toContain("至少 7");
+    expect(message.content).toContain("至少 48");
+    expect(message.content).toContain("至少 $1.2346");
+    expect(message.content).toContain("仅含已采集的最新记录");
+  });
+
+  it("在文字汇总降级时保留零值且只渲染一个安全图表", () => {
+    const withoutAccess = renderBroadcastMessage(snapshot(49, 20, 10), "event-2", true);
+    const withChart = renderBroadcastMessage(snapshot(49, 20, 10), "event-3", true, {
+      status: "available",
+      aggregate: aggregate(),
+      chartUrl: "https://example.test/chart.svg?a=1&b=2"
+    });
+
+    expect(withoutAccess.content).toContain("24 小时明细尚未授权");
+    expect(withoutAccess.content).not.toContain("<img");
+    expect(withChart.content).toContain("请求数：0");
+    expect(withChart.content).toContain("总 Token：0");
+    expect(withChart.content.match(/<img /g)).toHaveLength(1);
+    expect(withChart.content).toContain("a=1&amp;b=2");
   });
 });

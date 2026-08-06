@@ -282,7 +282,9 @@ describe("PushPlus callback", () => {
 
 describe("PushPlus dispatch", () => {
   it("发送带签名的固定结构载荷并记录服务商接受结果", async () => {
-    const event = claimedEvent();
+    const richContent =
+      '最近 24 小时总 Token：380<br><img src="https://worker.test/chart.svg?sig=abc">';
+    const event = claimedEvent({ content: richContent });
     const repo = dispatchRepository([event]);
     const fetchImpl = vi.fn(async (
       _input: RequestInfo | URL,
@@ -315,7 +317,7 @@ describe("PushPlus dispatch", () => {
       token: "pushplus-token",
       topic: "pushplus-topic",
       title: event.title,
-      content: event.content,
+      content: richContent,
       template: "html",
       channel: "wechat",
       timestamp: event.notAfter

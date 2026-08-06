@@ -3,13 +3,19 @@ import {
   createScheduledController
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   isShanghaiBroadcastSlot,
   runBroadcast,
   runScheduled
 } from "../src/app";
 import { SourceError, type QuotaSnapshot, type QuotaSource } from "../src/domain";
+import {
+  LeaseLostError,
+  Repository,
+  type SnapshotCommit
+} from "../src/repository";
+import type { UsageRecord } from "../src/usage-domain";
 
 const AT_0900 = Date.parse("2026-08-03T01:00:00.000Z");
 const AT_1000 = Date.parse("2026-08-03T02:00:00.000Z");
@@ -24,6 +30,27 @@ function snapshot(percent: number, observedAt: number): QuotaSnapshot {
       weekly: { status: "ok", usedPercent: percent, resetAt },
       monthly: { status: "ok", usedPercent: percent, resetAt }
     }
+  };
+}
+
+function usageRecord(
+  id: string,
+  occurredAt: number,
+  model = "gpt-5"
+): UsageRecord {
+  return {
+    id,
+    occurredAt,
+    provider: "openai",
+    model,
+    plan: "sub",
+    inputTokens: 100,
+    outputTokens: 50,
+    reasoningTokens: 25,
+    cacheReadTokens: 10,
+    cacheWrite5mTokens: 5,
+    cacheWrite1hTokens: 0,
+    costMicroCents: 1234
   };
 }
 
@@ -42,11 +69,16 @@ function testEnv(): Cloudflare.Env {
   } as unknown as Cloudflare.Env;
 }
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe("定时广播编排", () => {
   beforeEach(async () => {
     await env.DB.batch([
       env.DB.prepare("DELETE FROM event_triggers"),
       env.DB.prepare("DELETE FROM outbox_attempts"),
+      env.DB.prepare("DELETE FROM usage_chart_snapshots"),
       env.DB.prepare("DELETE FROM outbox_events"),
       env.DB.prepare("DELETE FROM runtime_state"),
       env.DB.prepare("DELETE FROM job_runs"),
@@ -108,6 +140,351 @@ describe("定时广播编排", () => {
       }
     ]);
     expect(sourceFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("定时额度与明细成功时原子保存同编号事件和图表快照", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    const usageSourceFetch = vi.fn().mockResolvedValue({
+      status: "complete" as const,
+      records: [
+        usageRecord("usage-1", scheduledAt - 60_000, "gpt-5"),
+        usageRecord("usage-2", scheduledAt - 120_000, "claude-sonnet")
+      ],
+      pagesRead: 1
+    });
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(scheduledAt),
+        cron: "0 1-15 * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        usageSource: { fetch: usageSourceFetch },
+        fetchImpl: vi.fn().mockResolvedValue(
+          Response.json({ code: 200, data: "provider-id" })
+        ),
+        now: () => scheduledAt
+      }
+    );
+
+    const event = await env.DB.prepare(
+      "SELECT id, content, status FROM outbox_events WHERE kind = 'daily'"
+    ).first<{ id: string; content: string; status: string }>();
+    expect(event?.status).toBe("succeeded");
+    expect(event?.content).toContain("最近 24 小时总 Token：380");
+    expect(event?.content).toContain("模型排行：");
+    expect(event?.content).toContain("gpt-5");
+    expect(event?.content).toContain(`/charts/usage/${event!.id}.svg?sig=`);
+    expect(event?.content).toContain("<img");
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots WHERE id = ?"
+    ).bind(event!.id).first()).toEqual({ count: 1 });
+    expect(usageSourceFetch).toHaveBeenCalledWith(scheduledAt);
+  });
+
+  it("手动广播复用明细图表链路且重复幂等键只投递一次", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const usageSourceFetch = vi.fn().mockResolvedValue({
+      status: "complete" as const,
+      records: [usageRecord("manual-usage", occurredAt - 60_000)],
+      pagesRead: 1
+    });
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+    const trigger = {
+      type: "manual" as const,
+      occurredAt,
+      idempotencyDigest: "usage-details-idempotency"
+    };
+    const deps = {
+      source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+      usageSource: { fetch: usageSourceFetch },
+      fetchImpl: pushFetch,
+      now: () => occurredAt
+    };
+
+    expect(await runBroadcast(trigger, testEnv(), deps)).toBe("completed");
+    expect(await runBroadcast(trigger, testEnv(), deps)).toBe("duplicate");
+
+    const event = await env.DB.prepare(
+      "SELECT id, content FROM outbox_events WHERE logical_key = ?"
+    ).bind("broadcast:manual:usage-details-idempotency").first<{
+      id: string;
+      content: string;
+    }>();
+    expect(event?.content).toContain("最近 24 小时");
+    expect(event?.content).toContain(`/charts/usage/${event!.id}.svg?sig=`);
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots WHERE id = ?"
+    ).bind(event!.id).first()).toEqual({ count: 1 });
+    expect(usageSourceFetch).toHaveBeenCalledOnce();
+    expect(pushFetch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["auth", "transient", "schema"] as const)(
+    "明细来源抛出 %s 时仅降级文字且不污染额度故障状态",
+    async (kind) => {
+      const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+      const usageSourceFetch = vi.fn().mockRejectedValue(
+        new SourceError(kind, "明细失败")
+      );
+      const expectedCopy = {
+        auth: "24 小时明细登录已失效",
+        transient: "24 小时明细暂时不可用",
+        schema: "24 小时明细格式已变化"
+      }[kind];
+
+      expect(await runBroadcast(
+        { type: "scheduled", occurredAt: scheduledAt },
+        testEnv(),
+        {
+          source: {
+            fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt))
+          },
+          usageSource: {
+            fetch: usageSourceFetch
+          },
+          fetchImpl: vi.fn().mockResolvedValue(
+            Response.json({ code: 200, data: "provider-id" })
+          ),
+          now: () => scheduledAt
+        }
+      )).toBe("completed");
+
+      const event = await env.DB.prepare(
+        "SELECT content FROM outbox_events WHERE kind = 'daily'"
+      ).first<{ content: string }>();
+      expect(event?.content).toContain("5 小时额度");
+      expect(event?.content).toContain("每周额度");
+      expect(event?.content).toContain("每月额度");
+      expect(event?.content).toContain(expectedCopy);
+      expect(event?.content).not.toContain("<img");
+      expect(await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
+      ).first()).toEqual({ count: 0 });
+      expect(await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM outbox_events WHERE kind = 'fault'"
+      ).first()).toEqual({ count: 0 });
+      const runtime = await env.DB.prepare(
+        "SELECT value_json FROM runtime_state WHERE key = 'runtime'"
+      ).first<{ value_json: string }>();
+      expect(JSON.parse(runtime!.value_json).faults.auth).toBeUndefined();
+      expect(usageSourceFetch).toHaveBeenCalledWith(scheduledAt);
+    }
+  );
+
+  it("合法空明细显示零汇总并保存零值图表", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+
+    expect(await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "complete",
+            records: [],
+            pagesRead: 1
+          })
+        },
+        fetchImpl: vi.fn().mockResolvedValue(
+          Response.json({ code: 200, data: "provider-id" })
+        ),
+        now: () => scheduledAt
+      }
+    )).toBe("completed");
+
+    const event = await env.DB.prepare(
+      "SELECT id, content FROM outbox_events WHERE kind = 'daily'"
+    ).first<{ id: string; content: string }>();
+    expect(event?.content).toContain("最近 24 小时请求数：0");
+    expect(event?.content).toContain("最近 24 小时总 Token：0");
+    expect(event?.content).toContain("暂无模型记录");
+    const chart = await env.DB.prepare(
+      "SELECT chart_json FROM usage_chart_snapshots WHERE id = ?"
+    ).bind(event!.id).first<{ chart_json: string }>();
+    const buckets = (JSON.parse(chart!.chart_json) as {
+      buckets: Array<Record<string, number>>;
+    }).buckets;
+    expect(buckets).toHaveLength(24);
+    expect(buckets.every((bucket) =>
+      bucket.inputTokens === 0 &&
+      bucket.outputTokens === 0 &&
+      bucket.reasoningTokens === 0 &&
+      bucket.cacheTokens === 0
+    )).toBe(true);
+  });
+
+  it("明细采集跨过定时槽位边界时跳过旧整点且不创建事件或快照", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    const slotEnd = Date.parse("2026-08-05T02:00:00Z");
+    let current = slotEnd - 10_000;
+    const usageSourceFetch = vi.fn(async () => {
+      current = slotEnd;
+      return { status: "complete" as const, records: [], pagesRead: 1 };
+    });
+
+    expect(await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        usageSource: { fetch: usageSourceFetch },
+        fetchImpl: vi.fn(),
+        now: () => current
+      }
+    )).toBe("completed");
+
+    expect(usageSourceFetch).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(
+      "SELECT status, error_kind FROM job_runs WHERE job_key = ?"
+    ).bind("broadcast:scheduled:2026-08-05:09").first()).toEqual({
+      status: "skipped",
+      error_kind: "expired-slot"
+    });
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events"
+    ).first()).toEqual({ count: 0 });
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
+    ).first()).toEqual({ count: 0 });
+  });
+
+  it("富消息图表事务失败时用同一事件编号回退文字明细", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    const originalCommit = Repository.prototype.commitSnapshotUnderLease;
+    const commits: SnapshotCommit[] = [];
+    vi.spyOn(Repository.prototype, "commitSnapshotUnderLease")
+      .mockImplementation(async function (
+        this: Repository,
+        input: SnapshotCommit
+      ) {
+        commits.push(input);
+        const sabotaged = input.usageChartSnapshots.length === 0
+          ? input
+          : {
+              ...input,
+              usageChartSnapshots: input.usageChartSnapshots.map((item) => ({
+                ...item,
+                chartJson: "{"
+              }))
+            };
+        await originalCommit.call(this, sabotaged);
+      });
+
+    expect(await runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "complete",
+            records: [usageRecord("usage-rollback", scheduledAt - 60_000)],
+            pagesRead: 1
+          })
+        },
+        fetchImpl: vi.fn().mockResolvedValue(
+          Response.json({ code: 200, data: "provider-id" })
+        ),
+        now: () => scheduledAt
+      }
+    )).toBe("completed");
+
+    expect(commits).toHaveLength(2);
+    expect(commits[0]!.usageChartSnapshots).toHaveLength(1);
+    expect(commits[1]!.usageChartSnapshots).toHaveLength(0);
+    expect(commits[0]!.events.at(-1)!.id).toBe(commits[1]!.events.at(-1)!.id);
+    const event = await env.DB.prepare(
+      "SELECT id, content FROM outbox_events WHERE kind = 'daily'"
+    ).first<{ id: string; content: string }>();
+    expect(event?.id).toBe(commits[0]!.events.at(-1)!.id);
+    expect(event?.content).toContain("最近 24 小时");
+    expect(event?.content).toContain("图表暂不可用");
+    expect(event?.content).not.toContain("<img");
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
+    ).first()).toEqual({ count: 0 });
+  });
+
+  it("富消息提交失去租约时继续抛出且不重试文字事件", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    const originalCommit = Repository.prototype.commitSnapshotUnderLease;
+    let commitCalls = 0;
+    vi.spyOn(Repository.prototype, "commitSnapshotUnderLease")
+      .mockImplementation(async function (
+        this: Repository,
+        input: SnapshotCommit
+      ) {
+        commitCalls += 1;
+        if (input.usageChartSnapshots.length > 0) throw new LeaseLostError();
+        await originalCommit.call(this, input);
+      });
+
+    await expect(runBroadcast(
+      { type: "scheduled", occurredAt: scheduledAt },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "complete",
+            records: [usageRecord("usage-lease", scheduledAt - 60_000)],
+            pagesRead: 1
+          })
+        },
+        fetchImpl: vi.fn(),
+        now: () => scheduledAt
+      }
+    )).rejects.toBeInstanceOf(LeaseLostError);
+
+    expect(commitCalls).toBe(1);
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_events"
+    ).first()).toEqual({ count: 0 });
+  });
+
+  it("图表快照清理失败不覆盖已完成广播或阻止投递", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const cleanup = vi.spyOn(
+      Repository.prototype,
+      "deleteExpiredUsageChartSnapshots"
+    ).mockRejectedValue(new Error("清理失败"));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    expect(await runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "cleanup-failure"
+      },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "unavailable",
+            reason: "not-authorized"
+          })
+        },
+        fetchImpl: pushFetch,
+        now: () => occurredAt
+      }
+    )).toBe("completed");
+
+    expect(cleanup).toHaveBeenCalledWith(
+      occurredAt - 30 * 24 * 60 * 60 * 1000,
+      200
+    );
+    expect(pushFetch).toHaveBeenCalledOnce();
   });
 
   it("静默时段在采集和投递前返回", async () => {

@@ -13,6 +13,10 @@ export interface AppConfig {
     callbackSecret: string;
     callbackBaseUrl: string;
   };
+  usageChart: {
+    publicBaseUrl: string;
+    signingSecret: string;
+  };
 }
 
 function required(value: string | undefined, name: string): string {
@@ -81,6 +85,27 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     throw new Error("MANUAL_TRIGGER_SECRET must be at least 32 characters");
   }
 
+  const publicBase = new URL(required(bindings.PUBLIC_BASE_URL, "PUBLIC_BASE_URL"));
+  if (publicBase.protocol !== "https:") {
+    throw new Error("PUBLIC_BASE_URL must use HTTPS");
+  }
+  if (publicBase.username || publicBase.password) {
+    throw new Error("PUBLIC_BASE_URL must not contain user info");
+  }
+  if (publicBase.pathname !== "/" || publicBase.search || publicBase.hash) {
+    throw new Error("PUBLIC_BASE_URL must be an origin only");
+  }
+  if (publicBase.port && publicBase.port !== "443") {
+    throw new Error("PUBLIC_BASE_URL must use the standard port");
+  }
+  const usageChartSigningSecret = required(
+    bindings.USAGE_CHART_SIGNING_SECRET,
+    "USAGE_CHART_SIGNING_SECRET"
+  );
+  if (usageChartSigningSecret.length < 32) {
+    throw new Error("USAGE_CHART_SIGNING_SECRET must be at least 32 characters");
+  }
+
   const consoleEnabled = bindings.OPENCODE_CONSOLE_ENABLED === "true";
   const sessionBundle = sourceName === "opencode-console" && consoleEnabled
     ? bindings.OPENCODE_SESSION_BUNDLE
@@ -100,6 +125,10 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
       topic: required(bindings.PUSHPLUS_TOPIC, "PUSHPLUS_TOPIC"),
       callbackSecret,
       callbackBaseUrl: callbackBase.origin
+    },
+    usageChart: {
+      publicBaseUrl: publicBase.origin,
+      signingSecret: usageChartSigningSecret
     }
   };
 }
