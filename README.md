@@ -25,7 +25,9 @@
 
 ## 授权、分页与降级
 
-用量明细依赖 `OPENCODE_SESSION_BUNDLE`。授权工具会在临时浏览器配置文件中要求用户完成一次 GitHub 登录，先捕获 `/go`，再从该页面通过站内导航进入 `/workspace/<工作区>/usage`，捕获页面发出的首个只读用量请求；结束后自动关闭浏览器并删除临时配置文件。
+用量明细依赖 `OPENCODE_SESSION_BUNDLE`。默认授权流程会在临时浏览器配置文件中要求用户完成一次 GitHub 登录，先从新建空白页捕获 `/go`，再通过站内导航进入 `/workspace/<工作区>/usage`，捕获页面发出的首个只读用量请求；结束后自动关闭浏览器并删除临时配置文件。
+
+可通过 `--profile` 使用一个专用的持久浏览器资料目录。首次使用的新目录或缺少 OpenCode 登录 Cookie 的旧目录会打开登录页，要求完成一次 GitHub 登录并进入工作区；工具会等到新的登录 Cookie 出现后再继续，结束后保留该目录。以后使用同一目录时，只要 OpenCode 登录状态仍有效，工具就会直接复用而不再打开登录页。工具始终不会删除调用方提供的目录；它会优先使用 `--workspace` 指定的工作区，否则只从恢复出的现有工作区页面识别。该目录可能包含 GitHub 和 OpenCode 登录 Cookie，应只保存在当前用户可访问的位置，不得提交、共享或写入日志。
 
 - 旧的 V1 会话包没有 `usage.list` 分页授权信息，系统会将 24 小时明细降级为“尚未授权”，但三项额度广播继续发送。
 - 如果 V2 会话包只授权了单页，而后续首次 `/usage` 正好满 50 条，系统不会把前 50 条冒充完整数据；会提示“分页尚未授权”，必须重新运行授权工具刷新授权包。
@@ -38,6 +40,14 @@
 ```powershell
 npm run auth:setup -- --version-only
 ```
+
+首次创建或以后复用持久登录资料时，使用：
+
+```powershell
+npm run auth:setup -- --profile "C:\安全位置\opencode-browser-profile" --workspace "wrk_Abc123" --version-only
+```
+
+请把示例中的 `wrk_Abc123` 替换为真实工作区 ID；该参数仅接受 `wrk_` 加字母或数字。首次创建该目录时仍需在打开的浏览器中登录一次并进入任一工作区。如果资料恢复后只有一个工作区，可以省略 `--workspace`；已有登录状态但无法识别工作区或同时识别出多个工作区时，工具会立即停止并提示补充参数。
 
 该模式把新会话包写入最新 Worker 版本的 `OPENCODE_SESSION_BUNDLE`，不会移动 preview alias，也不会发布生产版本。完成该命令后，仍须重新执行带 `--preview-alias usage-chart` 的版本上传，才能让预览 alias 指向含新会话包的版本。
 
@@ -70,8 +80,8 @@ git diff --check
 1. 确认生产根地址为 `https://opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev`，预览 alias 根地址为 `https://usage-chart-opencode-go-usage-broadcaster.opencode-go-usage-broadcaster.workers.dev`。后续预览一律使用后者。
 2. 先对远程 D1 应用 migration，再安全地创建 `USAGE_CHART_SIGNING_SECRET`；随后运行 `npx wrangler versions upload --dry-run`。`wrangler versions secret put` 只创建新版本，不会移动 preview alias。
 3. 第一次上传必须带 `--preview-alias usage-chart`、预览 `PUBLIC_BASE_URL` 和预览标签。确认 alias 对外公开、没有 Cloudflare Access。
-4. 在同一 PowerShell 会话运行 `npm run auth:setup -- --version-only`，完成一次 GitHub 登录；工具先访问 `/workspace/<工作区>/go`，再通过站内导航进入 `/workspace/<工作区>/usage`，捕获完成后关闭并清理临时 profile。两次上传之间暂停 CI 和其他发布。
-5. 再次执行 `npx wrangler versions upload --preview-alias usage-chart`，并再次传入预览 `PUBLIC_BASE_URL`，使 alias 移到含新会话包的版本；只核对最新版本 Secret 名称中含有 `OPENCODE_SESSION_BUNDLE` 与 `USAGE_CHART_SIGNING_SECRET`，不要读取或打印 Secret 值。
+4. 在同一 PowerShell 会话运行 `npm run auth:setup -- --version-only`，完成一次 GitHub 登录；若希望保存并在以后复用登录状态，则改用上面的 `--profile` 命令。工具从新建空白页访问 `/workspace/<工作区>/go`，再通过站内导航进入 `/workspace/<工作区>/usage`。默认临时 profile 会被清理，调用方提供的 profile 会保留。两次上传之间暂停 CI 和其他发布。
+5. 再次执行 `npx wrangler versions upload --preview-alias usage-chart`，并再次传入预览 `PUBLIC_BASE_URL`，使 alias 移到含新会话包的版本；只核对最终 alias 版本的 Secret 名称完整包含 `PUSHPLUS_TOKEN`、`PUSHPLUS_TOPIC`、`PUSHPLUS_CALLBACK_SECRET`、`PUSHPLUS_CALLBACK_BASE_URL`、`MANUAL_TRIGGER_SECRET`、`OPENCODE_SESSION_BUNDLE` 与 `USAGE_CHART_SIGNING_SECRET`，不要读取或打印 Secret 值。
 6. 仅向预览 alias 的 `/admin/manual-trigger` 发起一次带安全输入的 `MANUAL_TRIGGER_SECRET` 和唯一幂等键的请求，确认响应为 204。不要用 GitHub 生产工作流替代该验收。
 7. 在微信打开本次 PushPlus 详情，确认三项额度、24 小时文字汇总、模型排行和 SVG 都可见。若 SVG 不可见，停止生产发布，保留预览版本并回到设计决策；不要临时接入第三方图表，也不要声称验收通过。
 8. 只有上述微信门槛通过后，才推送分支并创建中文、非草稿 PR。PR 只能陈述实际完成的验证；合并后再在主分支运行 `npm run check` 与生产部署，并观察下一个北京时间整点。

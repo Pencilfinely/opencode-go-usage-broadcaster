@@ -6,7 +6,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { chromium, type BrowserContext, type Page } from "playwright-core";
 
-import { type OpenCodeSessionBundleV2 } from "../src/opencode-session";
+import {
+  type OpenCodeRequestDescriptor,
+  type OpenCodeSessionBundleV2
+} from "../src/opencode-session";
 import { OpenCodeConsoleQuotaSource } from "../src/source";
 import { OpenCodeUsageListSource } from "../src/opencode-usage-source";
 import {
@@ -21,6 +24,8 @@ import {
 const AUTH_URL = "https://opencode.ai/auth";
 const UPLOAD_SECRET_NAME = "OPENCODE_SESSION_BUNDLE";
 const UPLOAD_TIMEOUT_MS = 30_000;
+const CAPTURE_NAVIGATION_TIMEOUT_MS = 15_000;
+const WORKSPACE_ID = /^wrk_[A-Za-z0-9]+$/u;
 const WRANGLER_CLI = fileURLToPath(
   new URL("../node_modules/wrangler/bin/wrangler.js", import.meta.url)
 );
@@ -45,6 +50,12 @@ export type UploadDependencies = {
 
 export type UploadMode = "deployed" | "version-only";
 
+export type AuthSetupOptions = {
+  uploadMode: UploadMode;
+  profileDirectory?: string;
+  workspaceId?: string;
+};
+
 export type UploadOptions = {
   uploadMode?: UploadMode;
   dependencies?: UploadDependencies;
@@ -52,12 +63,51 @@ export type UploadOptions = {
 
 export function parseAuthSetupArgs(
   argv: readonly string[]
-): { uploadMode: UploadMode } {
-  if (argv.length === 0) return { uploadMode: "deployed" };
-  if (argv.length === 1 && argv[0] === "--version-only") {
-    return { uploadMode: "version-only" };
+): AuthSetupOptions {
+  let uploadMode: UploadMode = "deployed";
+  let profileDirectory: string | undefined;
+  let workspaceId: string | undefined;
+  const seen = new Set<string>();
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === undefined || seen.has(argument)) {
+      throw new Error("授权参数重复或无效");
+    }
+    if (argument === "--version-only") {
+      seen.add(argument);
+      uploadMode = "version-only";
+      continue;
+    }
+    if (argument === "--profile") {
+      seen.add(argument);
+      const value = argv[index + 1];
+      if (value === undefined || value.trim() === "" || value.startsWith("--")) {
+        throw new Error("--profile 必须提供浏览器资料目录");
+      }
+      profileDirectory = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--workspace") {
+      seen.add(argument);
+      const value = argv[index + 1];
+      if (value === undefined || !WORKSPACE_ID.test(value)) {
+        throw new Error("--workspace 必须是有效的工作区 ID");
+      }
+      workspaceId = value;
+      index += 1;
+      continue;
+    }
+    throw new Error("仅支持 --version-only、--profile 和 --workspace 参数");
   }
-  throw new Error("仅支持可选参数 --version-only");
+  if (workspaceId !== undefined && profileDirectory === undefined) {
+    throw new Error("--workspace 只能与 --profile 一起使用");
+  }
+  return {
+    uploadMode,
+    ...(profileDirectory === undefined ? {} : { profileDirectory }),
+    ...(workspaceId === undefined ? {} : { workspaceId })
+  };
 }
 
 export function buildWranglerSecretArgs(
@@ -166,6 +216,23 @@ async function pauseBeforeCandidateCheck(signal: AbortSignal): Promise<void> {
 }
 
 type PageUrlContext = Pick<BrowserContext, "pages">;
+type NewPageContext = Pick<BrowserContext, "newPage">;
+type CookieContext = Pick<BrowserContext, "cookies">;
+
+export async function openAuthenticationPage(
+  context: NewPageContext,
+  signal: AbortSignal
+): Promise<Page> {
+  signal.throwIfAborted();
+  const page = await context.newPage();
+  signal.throwIfAborted();
+  await page.goto(AUTH_URL, {
+    signal,
+    timeout: CAPTURE_NAVIGATION_TIMEOUT_MS,
+    waitUntil: "commit"
+  });
+  return page;
+}
 
 export async function waitForWorkspaceId(
   context: PageUrlContext,
@@ -182,6 +249,126 @@ export async function waitForWorkspaceId(
   }
 }
 
+export function resolveProfileWorkspaceId(
+  context: PageUrlContext,
+  requested?: string
+): string {
+  if (requested !== undefined) {
+    if (!WORKSPACE_ID.test(requested)) throw new Error("工作区 ID 无效");
+    return requested;
+  }
+  const workspaceIds = new Set<string>();
+  for (const page of context.pages()) {
+    const workspaceId = workspaceIdFromPageUrl(page.url());
+    if (workspaceId) workspaceIds.add(workspaceId);
+  }
+  if (workspaceIds.size === 1) return [...workspaceIds][0] as string;
+  throw new Error("复用浏览器资料时无法唯一识别工作区，请通过 --workspace 指定");
+}
+
+export async function requireOpenCodeAuthCookie(
+  context: CookieContext
+): Promise<string> {
+  const authCookieValue = await readOpenCodeAuthCookie(context);
+  if (authCookieValue === undefined) throw new Error("未检测到 OpenCode auth Cookie");
+  return authCookieValue;
+}
+
+export async function readOpenCodeAuthCookie(
+  context: CookieContext
+): Promise<string | undefined> {
+  const authCookie = (await context.cookies(OPENCODE_ORIGIN)).find(
+    (cookie) => cookie.name === "auth" && cookie.value.length > 0
+  );
+  return authCookie?.value;
+}
+
+export async function waitForOpenCodeAuthCookie(
+  context: CookieContext,
+  signal: AbortSignal,
+  pause: CandidatePause = pauseBeforeCandidateCheck
+): Promise<string> {
+  while (true) {
+    signal.throwIfAborted();
+    const authCookieValue = await readOpenCodeAuthCookie(context);
+    if (authCookieValue !== undefined) return authCookieValue;
+    await pause(signal);
+  }
+}
+
+export async function resolveReusableProfile(
+  context: PageUrlContext & CookieContext,
+  requestedWorkspaceId?: string
+): Promise<{ workspaceId: string; authCookieValue: string }> {
+  const authCookieValue = await requireOpenCodeAuthCookie(context);
+  const workspaceId = resolveProfileWorkspaceId(context, requestedWorkspaceId);
+  return { workspaceId, authCookieValue };
+}
+
+export async function preparePersistentProfileAuthorization(
+  context: PageUrlContext & CookieContext & NewPageContext,
+  requestedWorkspaceId: string | undefined,
+  signal: AbortSignal,
+  onLoginRequired: () => void = () => undefined
+): Promise<{
+  workspaceId: string;
+  authCookieValue: string;
+  reusedExistingSession: boolean;
+}> {
+  signal.throwIfAborted();
+  const existingAuthCookieValue = await readOpenCodeAuthCookie(context);
+  if (existingAuthCookieValue !== undefined) {
+    return {
+      workspaceId: resolveProfileWorkspaceId(context, requestedWorkspaceId),
+      authCookieValue: existingAuthCookieValue,
+      reusedExistingSession: true
+    };
+  }
+
+  await openAuthenticationPage(context, signal);
+  signal.throwIfAborted();
+  onLoginRequired();
+  const authCookieValue = await waitForOpenCodeAuthCookie(context, signal);
+  let workspaceId: string;
+  if (requestedWorkspaceId === undefined) {
+    await waitForWorkspaceId(context, signal);
+    workspaceId = resolveProfileWorkspaceId(context);
+  } else {
+    workspaceId = resolveProfileWorkspaceId(context, requestedWorkspaceId);
+  }
+  return { workspaceId, authCookieValue, reusedExistingSession: false };
+}
+
+type GoRequestWaiter = (
+  page: Page,
+  workspaceId: string,
+  signal: AbortSignal
+) => Promise<OpenCodeRequestDescriptor>;
+
+export async function captureGoAuthorization(
+  context: NewPageContext,
+  workspaceId: string,
+  signal: AbortSignal,
+  waitForRequest: GoRequestWaiter = waitForGoRequest
+): Promise<{ page: Page; goRequest: OpenCodeRequestDescriptor }> {
+  signal.throwIfAborted();
+  const page = await context.newPage();
+  signal.throwIfAborted();
+  const goRequest = await waitBeforeTrigger(
+    signal,
+    (waiterSignal) => waitForRequest(page, workspaceId, waiterSignal),
+    (triggerSignal) => page.goto(
+      `${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`,
+      {
+        signal: triggerSignal,
+        timeout: CAPTURE_NAVIGATION_TIMEOUT_MS,
+        waitUntil: "commit"
+      }
+    ).then(() => undefined)
+  );
+  return { page, goRequest };
+}
+
 export { buildV2SessionBundle as buildSessionBundle };
 
 type BrowserProfile = Pick<BrowserContext, "close">;
@@ -190,45 +377,63 @@ type ProfileRemover = (directory: string) => Promise<void>;
 export async function cleanUpBrowserProfile(
   context: BrowserProfile | undefined,
   profileDirectory: string,
-  removeProfile: ProfileRemover = (directory) => rm(directory, { recursive: true, force: true })
+  removeProfile: ProfileRemover = (directory) => rm(directory, { recursive: true, force: true }),
+  removeDirectory = true
 ): Promise<void> {
   try {
     await context?.close();
   } finally {
-    await removeProfile(profileDirectory);
+    if (removeDirectory) await removeProfile(profileDirectory);
   }
 }
 
-async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessionBundleV2> {
-  const profileDirectory = await mkdtemp(join(tmpdir(), "opencode-auth-"));
+async function collectSessionBundle(
+  signal: AbortSignal,
+  options: Pick<AuthSetupOptions, "profileDirectory" | "workspaceId"> = {}
+): Promise<OpenCodeSessionBundleV2> {
+  const providedProfile = options.profileDirectory;
+  const ownsProfile = providedProfile === undefined;
+  const profileDirectory = providedProfile === undefined
+    ? await mkdtemp(join(tmpdir(), "opencode-auth-"))
+    : resolve(providedProfile);
   let context: BrowserContext | undefined;
   try {
     signal.throwIfAborted();
     context = await launchVisibleContext(profileDirectory);
     signal.throwIfAborted();
-    const page = await context.newPage();
-    await page.goto(AUTH_URL);
-    console.log(
-      "请在打开的浏览器中完成 GitHub 登录并进入目标工作区；工具会自动打开用量页并继续。"
-    );
-
-    const workspaceId = await waitForWorkspaceId(context, signal);
+    let workspaceId: string;
+    let authCookieValue: string;
+    if (ownsProfile) {
+      await openAuthenticationPage(context, signal);
+      console.log(
+        "请在打开的浏览器中完成 GitHub 登录并进入目标工作区；工具会自动打开用量页并继续。"
+      );
+      workspaceId = await waitForWorkspaceId(context, signal);
+      authCookieValue = await requireOpenCodeAuthCookie(context);
+    } else {
+      const persistentProfile = await preparePersistentProfileAuthorization(
+        context,
+        options.workspaceId,
+        signal,
+        () => console.log(
+          "请完成一次 GitHub 登录并进入任一工作区；登录状态会保留在指定的浏览器资料目录。"
+        )
+      );
+      workspaceId = persistentProfile.workspaceId;
+      authCookieValue = persistentProfile.authCookieValue;
+      console.log(
+        persistentProfile.reusedExistingSession
+          ? "授权阶段：已复用现有登录资料"
+          : "授权阶段：首次登录状态已保留"
+      );
+    }
     signal.throwIfAborted();
     console.log("授权阶段：已识别工作区，开始捕获 go");
-    const goRequest = await waitBeforeTrigger(
-      signal,
-      (waiterSignal) => waitForGoRequest(page, workspaceId, waiterSignal),
-      (triggerSignal) => page.goto(
-        `${OPENCODE_ORIGIN}/workspace/${workspaceId}/go`,
-        { signal: triggerSignal }
-      ).then(() => undefined)
+    const { page, goRequest } = await captureGoAuthorization(
+      context,
+      workspaceId,
+      signal
     );
-    const authCookie = (await context.cookies(OPENCODE_ORIGIN)).find(
-      (cookie) => cookie.name === "auth"
-    );
-    if (!authCookie) {
-      throw new Error("已识别工作区，但未检测到 OpenCode auth Cookie");
-    }
     console.log("授权阶段：go 已捕获，开始捕获 usage 第 0 页");
     const page0 = await waitBeforeTrigger(
       signal,
@@ -246,7 +451,7 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
       page0.records.length
     );
     signal.throwIfAborted();
-    const bundle = buildV2SessionBundle(workspaceId, authCookie.value, goRequest, usageList);
+    const bundle = buildV2SessionBundle(workspaceId, authCookieValue, goRequest, usageList);
     console.log("授权阶段：会话包已生成，开始真实回放");
     const replay = await new OpenCodeUsageListSource(bundle).fetch(Date.now());
     if (replay.status === "unavailable") {
@@ -254,7 +459,12 @@ async function collectSessionBundle(signal: AbortSignal): Promise<OpenCodeSessio
     }
     return bundle;
   } finally {
-    await cleanUpBrowserProfile(context, profileDirectory);
+    await cleanUpBrowserProfile(
+      context,
+      profileDirectory,
+      (directory) => rm(directory, { recursive: true, force: true }),
+      ownsProfile
+    );
   }
 }
 
@@ -349,8 +559,13 @@ async function main(): Promise<void> {
   const onSigint = () => controller.abort(new Error("授权已取消"));
   process.on("SIGINT", onSigint);
   try {
-    const { uploadMode } = parseAuthSetupArgs(process.argv.slice(2));
-    const bundle = await collectSessionBundle(controller.signal);
+    const { uploadMode, profileDirectory, workspaceId } = parseAuthSetupArgs(
+      process.argv.slice(2)
+    );
+    const bundle = await collectSessionBundle(controller.signal, {
+      ...(profileDirectory === undefined ? {} : { profileDirectory }),
+      ...(workspaceId === undefined ? {} : { workspaceId })
+    });
     controller.signal.throwIfAborted();
     const snapshot = await new OpenCodeConsoleQuotaSource(bundle).fetch(new Date());
     controller.signal.throwIfAborted();

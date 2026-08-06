@@ -377,6 +377,34 @@ test("仅接受可选的版本级上传参数", async () => {
   assert.throws(() => parseAuthSetupArgs?.(["--bad"]));
 });
 
+test("解析复用浏览器资料、工作区和版本级上传参数", async () => {
+  const module = await import("./auth-setup");
+  const parseAuthSetupArgs = (module as Record<string, unknown>)
+    .parseAuthSetupArgs as ((argv: readonly string[]) => unknown) | undefined;
+
+  assert.deepEqual(
+    parseAuthSetupArgs?.([
+      "--profile",
+      "C:\\OpenCode授权资料",
+      "--workspace",
+      "wrk_Target9",
+      "--version-only"
+    ]),
+    {
+      uploadMode: "version-only",
+      profileDirectory: "C:\\OpenCode授权资料",
+      workspaceId: "wrk_Target9"
+    }
+  );
+  assert.throws(() => parseAuthSetupArgs?.(["--profile"]));
+  assert.throws(() => parseAuthSetupArgs?.(["--workspace", "not-safe"]));
+  assert.throws(
+    () => parseAuthSetupArgs?.(["--workspace", "wrk_Target9"]),
+    /--profile/u
+  );
+  assert.throws(() => parseAuthSetupArgs?.(["--version-only", "--version-only"]));
+});
+
 test("从目标工作区页及其子页识别受限的工作区 ID", async () => {
   const module = await import("./auth-setup");
   const workspaceIdFromPageUrl = (module as Record<string, unknown>)
@@ -551,6 +579,288 @@ test("轮询当前及上下文页面直到识别目标工作区", async () => {
   assert.equal(pauses, 1);
 });
 
+test("复用资料时优先使用显式工作区，否则仅从已有页面识别", async () => {
+  const module = await import("./auth-setup");
+  const resolveProfileWorkspaceId = (module as Record<string, unknown>)
+    .resolveProfileWorkspaceId as ((
+      context: { pages(): Array<{ url(): string }> },
+      requested?: string
+    ) => string) | undefined;
+
+  assert.equal(typeof resolveProfileWorkspaceId, "function");
+  if (!resolveProfileWorkspaceId) return;
+  const context = {
+    pages: () => [{ url: () => "https://opencode.ai/workspace/wrk_Saved/go" }]
+  };
+  assert.equal(resolveProfileWorkspaceId(context, "wrk_Explicit"), "wrk_Explicit");
+  assert.equal(resolveProfileWorkspaceId(context), "wrk_Saved");
+  assert.throws(
+    () => resolveProfileWorkspaceId({ pages: () => [] }),
+    /--workspace/u
+  );
+  assert.throws(
+    () => resolveProfileWorkspaceId({
+      pages: () => [
+        { url: () => "https://opencode.ai/workspace/wrk_First/go" },
+        { url: () => "https://opencode.ai/workspace/wrk_Second/usage" }
+      ]
+    }),
+    /--workspace/u
+  );
+});
+
+test("登录页只等待文档提交，不限制用户完成登录的时间", async () => {
+  const module = await import("./auth-setup");
+  const openAuthenticationPage = (module as Record<string, unknown>)
+    .openAuthenticationPage as ((
+      context: { newPage(): Promise<unknown> },
+      signal: AbortSignal
+    ) => Promise<unknown>) | undefined;
+
+  assert.equal(typeof openAuthenticationPage, "function");
+  if (!openAuthenticationPage) return;
+  const actions: string[] = [];
+  const controller = new AbortController();
+  const page = {
+    async goto(url: string, options: Record<string, unknown>) {
+      actions.push("打开登录页");
+      assert.equal(url, "https://opencode.ai/auth");
+      assert.equal(options.waitUntil, "commit");
+      assert.equal(options.timeout, 15_000);
+      assert.equal(options.signal, controller.signal);
+    }
+  };
+
+  const opened = await openAuthenticationPage(
+    {
+      async newPage() {
+        actions.push("新建页面");
+        return page;
+      }
+    },
+    controller.signal
+  );
+
+  assert.equal(opened, page);
+  assert.deepEqual(actions, ["新建页面", "打开登录页"]);
+});
+
+test("复用浏览器资料时先校验登录 Cookie，再识别工作区", async () => {
+  const module = await import("./auth-setup");
+  const resolveReusableProfile = (module as Record<string, unknown>)
+    .resolveReusableProfile as ((
+      context: {
+        cookies(url: string): Promise<Array<{ name: string; value: string }>>;
+        pages(): Array<{ url(): string }>;
+      },
+      requested?: string
+    ) => Promise<{ workspaceId: string; authCookieValue: string }>) | undefined;
+
+  assert.equal(typeof resolveReusableProfile, "function");
+  if (!resolveReusableProfile) return;
+  let pagesRead = 0;
+  await assert.rejects(
+    resolveReusableProfile({
+      async cookies(url) {
+        assert.equal(url, "https://opencode.ai");
+        return [];
+      },
+      pages() {
+        pagesRead += 1;
+        return [{ url: () => "https://opencode.ai/workspace/wrk_Saved/go" }];
+      }
+    }),
+    /auth Cookie/u
+  );
+  assert.equal(pagesRead, 0);
+
+  const resolved = await resolveReusableProfile({
+    async cookies() {
+      return [{ name: "auth", value: "cookie-value" }];
+    },
+    pages() {
+      return [{ url: () => "https://opencode.ai/workspace/wrk_Saved/go" }];
+    }
+  });
+  assert.deepEqual(resolved, {
+    workspaceId: "wrk_Saved",
+    authCookieValue: "cookie-value"
+  });
+});
+
+test("全新持久资料会完成首次登录并保留可复用状态", async () => {
+  const module = await import("./auth-setup");
+  const preparePersistentProfileAuthorization = (module as Record<string, unknown>)
+    .preparePersistentProfileAuthorization as ((
+      context: {
+        cookies(url: string): Promise<Array<{ name: string; value: string }>>;
+        pages(): Array<{ url(): string }>;
+        newPage(): Promise<unknown>;
+      },
+      requestedWorkspaceId: string | undefined,
+      signal: AbortSignal,
+      onLoginRequired: () => void
+    ) => Promise<{
+      workspaceId: string;
+      authCookieValue: string;
+      reusedExistingSession: boolean;
+    }>) | undefined;
+
+  assert.equal(typeof preparePersistentProfileAuthorization, "function");
+  if (!preparePersistentProfileAuthorization) return;
+  const actions: string[] = [];
+  let loggedIn = false;
+  const controller = new AbortController();
+  const page = {
+    async goto(url: string, options: Record<string, unknown>) {
+      actions.push("打开登录页");
+      assert.equal(url, "https://opencode.ai/auth");
+      assert.equal(options.waitUntil, "commit");
+      assert.equal(options.signal, controller.signal);
+      loggedIn = true;
+    }
+  };
+
+  const prepared = await preparePersistentProfileAuthorization(
+    {
+      async cookies(url) {
+        actions.push("检查 Cookie");
+        assert.equal(url, "https://opencode.ai");
+        return loggedIn ? [{ name: "auth", value: "saved-cookie" }] : [];
+      },
+      pages() {
+        actions.push("识别工作区");
+        return loggedIn
+          ? [{ url: () => "https://opencode.ai/workspace/wrk_Saved/go" }]
+          : [];
+      },
+      async newPage() {
+        actions.push("新建页面");
+        return page;
+      }
+    },
+    undefined,
+    controller.signal,
+    () => { actions.push("提示首次登录"); }
+  );
+
+  assert.deepEqual(prepared, {
+    workspaceId: "wrk_Saved",
+    authCookieValue: "saved-cookie",
+    reusedExistingSession: false
+  });
+  assert.deepEqual(actions, [
+    "检查 Cookie",
+    "新建页面",
+    "打开登录页",
+    "提示首次登录",
+    "检查 Cookie",
+    "识别工作区",
+    "识别工作区",
+  ]);
+});
+
+test("持久资料 Cookie 失效时不把旧工作区标签页误判为登录完成", async () => {
+  const module = await import("./auth-setup");
+  const preparePersistentProfileAuthorization = (module as Record<string, unknown>)
+    .preparePersistentProfileAuthorization as ((
+      context: {
+        cookies(url: string): Promise<Array<{ name: string; value: string }>>;
+        pages(): Array<{ url(): string }>;
+        newPage(): Promise<unknown>;
+      },
+      requestedWorkspaceId: string | undefined,
+      signal: AbortSignal,
+      onLoginRequired: () => void
+    ) => Promise<{ workspaceId: string; authCookieValue: string }>) | undefined;
+
+  assert.equal(typeof preparePersistentProfileAuthorization, "function");
+  if (!preparePersistentProfileAuthorization) return;
+  let cookieChecks = 0;
+  const prepared = await preparePersistentProfileAuthorization(
+    {
+      async cookies() {
+        cookieChecks += 1;
+        return cookieChecks >= 2
+          ? [{ name: "auth", value: "renewed-cookie" }]
+          : [];
+      },
+      pages() {
+        if (cookieChecks < 2) {
+          throw new Error("登录完成前不应读取旧工作区标签页");
+        }
+        return [{ url: () => "https://opencode.ai/workspace/wrk_Old/go" }];
+      },
+      async newPage() {
+        return { async goto() { return undefined; } };
+      }
+    },
+    undefined,
+    new AbortController().signal,
+    () => undefined
+  );
+
+  assert.deepEqual(prepared, {
+    workspaceId: "wrk_Old",
+    authCookieValue: "renewed-cookie",
+    reusedExistingSession: false
+  });
+  assert.equal(cookieChecks, 2);
+});
+
+test("从新建空白页以 commit 导航触发 go 捕获", async () => {
+  const module = await import("./auth-setup");
+  const captureGoAuthorization = (module as Record<string, unknown>)
+    .captureGoAuthorization as ((
+      context: { newPage(): Promise<unknown> },
+      workspaceId: string,
+      signal: AbortSignal,
+      waitForRequest: (
+        page: unknown,
+        workspaceId: string,
+        signal: AbortSignal
+      ) => Promise<unknown>
+    ) => Promise<{ page: unknown; goRequest: unknown }>) | undefined;
+
+  assert.equal(typeof captureGoAuthorization, "function");
+  if (!captureGoAuthorization) return;
+  const actions: string[] = [];
+  const goRequest = {
+    url: "https://opencode.ai/workspace/wrk_Target9/go",
+    method: "GET",
+    headers: { accept: "text/html" }
+  };
+  const page = {
+    async goto(url: string, options: Record<string, unknown>) {
+      actions.push("触发导航");
+      assert.equal(url, goRequest.url);
+      assert.equal(options.waitUntil, "commit");
+      assert.equal(options.timeout, 15_000);
+    }
+  };
+
+  const captured = await captureGoAuthorization(
+    {
+      async newPage() {
+        actions.push("新建空白页");
+        return page;
+      }
+    },
+    "wrk_Target9",
+    new AbortController().signal,
+    async (receivedPage, workspaceId) => {
+      actions.push("登记响应等待");
+      assert.equal(receivedPage, page);
+      assert.equal(workspaceId, "wrk_Target9");
+      return goRequest;
+    }
+  );
+
+  assert.deepEqual(actions, ["新建空白页", "登记响应等待", "触发导航"]);
+  assert.equal(captured.page, page);
+  assert.deepEqual(captured.goRequest, goRequest);
+});
+
 test("为已识别工作区构造经严格校验的 V2 会话包", async () => {
   const module = await import("./auth-setup");
   const buildSessionBundle = (module as Record<string, unknown>)
@@ -642,6 +952,19 @@ test("浏览器关闭失败时仍清理资料目录", async () => {
     /关闭失败/u
   );
   assert.deepEqual(actions, ["关闭浏览器", "删除目录"]);
+});
+
+test("调用方提供的浏览器资料只关闭浏览器而不删除目录", async () => {
+  const actions: string[] = [];
+
+  await cleanUpBrowserProfile(
+    { close: async () => { actions.push("关闭浏览器"); } },
+    "C:\\持久授权资料",
+    async () => { actions.push("删除目录"); },
+    false
+  );
+
+  assert.deepEqual(actions, ["关闭浏览器"]);
 });
 
 test("上传输入失败时终止仍在运行的上传子进程", async () => {
