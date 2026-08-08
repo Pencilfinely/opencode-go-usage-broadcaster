@@ -191,6 +191,132 @@ describe("定时广播编排", () => {
     expect(usageSourceFetch).toHaveBeenCalledWith(scheduledAt);
   });
 
+  it("图片链路超过初始租约时续期后只提交并投递一次", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    let current = occurredAt;
+    const chartImagePublisher = vi.fn(async () => {
+      current += 71_000;
+      return "https://pic.pushplus.plus/1/renewed-usage-chart.png@p";
+    });
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    expect(await runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "renew-long-image-chain"
+      },
+      testEnv(),
+      {
+        source: {
+          fetch: vi.fn(async () => {
+            current += 31_250;
+            return snapshot(20, current);
+          })
+        },
+        usageSource: {
+          fetch: vi.fn(async () => {
+            current += 25_000;
+            return { status: "complete" as const, records: [], pagesRead: 1 };
+          })
+        },
+        chartImagePublisher,
+        fetchImpl: pushFetch,
+        now: () => current
+      }
+    )).toBe("completed");
+
+    expect(current - occurredAt).toBe(127_250);
+    expect(chartImagePublisher).toHaveBeenCalledOnce();
+    expect(pushFetch).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(
+      "SELECT status, content FROM outbox_events WHERE logical_key = ?"
+    ).bind("broadcast:manual:renew-long-image-chain").first<{
+      status: string;
+      content: string;
+    }>()).toMatchObject({
+      status: "succeeded",
+      content: expect.stringContaining(
+        "https://pic.pushplus.plus/1/renewed-usage-chart.png@p"
+      )
+    });
+  });
+
+  it("图片发布前续租失败时不上传提交或投递", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const renew = vi.spyOn(Repository.prototype, "renewSnapshotLease")
+      .mockResolvedValue(false);
+    const commit = vi.spyOn(Repository.prototype, "commitSnapshotUnderLease");
+    const chartImagePublisher = vi.fn().mockResolvedValue(
+      "https://pic.pushplus.plus/1/must-not-publish.png@p"
+    );
+    const pushFetch = vi.fn();
+
+    await expect(runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "renew-before-publish-lost"
+      },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "complete",
+            records: [],
+            pagesRead: 1
+          })
+        },
+        chartImagePublisher,
+        fetchImpl: pushFetch,
+        now: () => occurredAt
+      }
+    )).rejects.toBeInstanceOf(LeaseLostError);
+
+    expect(renew).toHaveBeenCalledOnce();
+    expect(chartImagePublisher).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+    expect(pushFetch).not.toHaveBeenCalled();
+  });
+
+  it("明细不可用时提交前续租失败不提交或投递", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const renew = vi.spyOn(Repository.prototype, "renewSnapshotLease")
+      .mockResolvedValue(false);
+    const commit = vi.spyOn(Repository.prototype, "commitSnapshotUnderLease");
+    const chartImagePublisher = vi.fn();
+    const pushFetch = vi.fn();
+
+    await expect(runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "renew-unavailable-lost"
+      },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "unavailable",
+            reason: "not-authorized"
+          })
+        },
+        chartImagePublisher,
+        fetchImpl: pushFetch,
+        now: () => occurredAt
+      }
+    )).rejects.toBeInstanceOf(LeaseLostError);
+
+    expect(renew).toHaveBeenCalledOnce();
+    expect(chartImagePublisher).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+    expect(pushFetch).not.toHaveBeenCalled();
+  });
+
   it("同一手动幂等键只发布并投递一次 PNG", async () => {
     const occurredAt = Date.parse("2026-08-05T02:30:00Z");
     const usageSourceFetch = vi.fn().mockResolvedValue({

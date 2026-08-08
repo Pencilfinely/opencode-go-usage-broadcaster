@@ -9,6 +9,7 @@ import {
 import { dispatchDue } from "./pushplus";
 import { PushPlusImageError, uploadPushPlusPng } from "./pushplus-image";
 import {
+  LeaseLostError,
   Repository,
   type EventKind,
   type NewOutboxEvent
@@ -705,6 +706,14 @@ export async function runBroadcast(
       );
       let targetEvent = textOnlyEvent;
       if (usageView.status === "available") {
+        const publishNow = clock();
+        if (!await repo.renewSnapshotLease(
+          owner,
+          publishNow,
+          SNAPSHOT_LEASE_MS
+        )) {
+          throw new LeaseLostError();
+        }
         try {
           const chartUrl = await chartImagePublisher(
             usageView.aggregate,
@@ -746,6 +755,13 @@ export async function runBroadcast(
       }
 
       const commitNow = clock();
+      if (!await repo.renewSnapshotLease(
+        owner,
+        commitNow,
+        SNAPSHOT_LEASE_MS
+      )) {
+        throw new LeaseLostError();
+      }
       const commonCommit = {
         owner,
         now: commitNow,

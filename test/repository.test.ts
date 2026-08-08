@@ -72,6 +72,46 @@ describe("D1 repository", () => {
     ).toEqual({ status: "retryable", next_attempt_at: now + 2 });
   });
 
+  it("仅由当前所有者续期未过期的快照租约", async () => {
+    const repo = new Repository(env.DB);
+    const acquiredAt = Date.parse("2026-08-03T01:00:00Z");
+    const renewedAt = acquiredAt + 30_000;
+
+    expect(await repo.acquireSnapshotLease("续租所有者", acquiredAt, 90_000))
+      .toBe(true);
+    expect(await repo.renewSnapshotLease("续租所有者", renewedAt, 120_000))
+      .toBe(true);
+    expect(await env.DB.prepare(
+      "SELECT owner, lease_until FROM locks WHERE name = 'snapshot'"
+    ).first()).toEqual({
+      owner: "续租所有者",
+      lease_until: renewedAt + 120_000
+    });
+  });
+
+  it.each([
+    ["错误所有者", "其他所有者", 1],
+    ["已经过期", "原所有者", 90_000]
+  ])("%s不能续期快照租约", async (_caseName, renewingOwner, elapsedMs) => {
+    const repo = new Repository(env.DB);
+    const acquiredAt = Date.parse("2026-08-03T01:00:00Z");
+    const originalLeaseUntil = acquiredAt + 90_000;
+
+    expect(await repo.acquireSnapshotLease("原所有者", acquiredAt, 90_000))
+      .toBe(true);
+    expect(await repo.renewSnapshotLease(
+      renewingOwner,
+      acquiredAt + elapsedMs,
+      120_000
+    )).toBe(false);
+    expect(await env.DB.prepare(
+      "SELECT owner, lease_until FROM locks WHERE name = 'snapshot'"
+    ).first()).toEqual({
+      owner: "原所有者",
+      lease_until: originalLeaseUntil
+    });
+  });
+
   it("领取事件时在同一事务中创建对应投递尝试", async () => {
     const repo = new Repository(env.DB);
     const now = Date.parse("2026-08-03T01:30:00Z");
