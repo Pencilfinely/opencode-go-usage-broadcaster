@@ -7,12 +7,11 @@ import {
   type SourceErrorKind
 } from "./domain";
 import { dispatchDue } from "./pushplus";
+import { PushPlusImageError, uploadPushPlusPng } from "./pushplus-image";
 import {
-  LeaseLostError,
   Repository,
   type EventKind,
-  type NewOutboxEvent,
-  type UsageChartSnapshotWrite
+  type NewOutboxEvent
 } from "./repository";
 import {
   evaluateSnapshot,
@@ -24,11 +23,9 @@ import {
 } from "./rules";
 import { createQuotaSource } from "./source";
 import { aggregateUsage24h } from "./usage-aggregate";
-import {
-  createUsageChartUrl,
-  serializeUsageChartData
-} from "./usage-chart";
+import { UsageChartPngError, renderUsageChartPng } from "./usage-chart-png";
 import type {
+  UsageAggregate,
   UsageDetailsSource,
   UsageDetailsView,
   UsageUnavailableReason
@@ -57,11 +54,17 @@ export interface RuntimeState {
 export interface AppDeps {
   source?: QuotaSource;
   usageSource?: UsageDetailsSource;
+  chartImagePublisher?: UsageChartImagePublisher;
   fetchImpl?: typeof fetch;
   sourceFetchImpl?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
 }
+
+export type UsageChartImagePublisher = (
+  aggregate: UsageAggregate,
+  eventId: string
+) => Promise<string>;
 
 export type BroadcastTrigger =
   | { type: "scheduled"; occurredAt: number }
@@ -232,6 +235,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function isPushPlusPictureUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname === "pic.pushplus.plus" &&
+      !url.username && !url.password && !url.port;
+  } catch {
+    return false;
+  }
+}
+
 function validateSnapshot(snapshot: unknown): number {
   if (
     !isRecord(snapshot) ||
@@ -370,6 +383,25 @@ export async function runBroadcast(
   );
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? defaultSleep;
+  const chartImagePublisher = deps.chartImagePublisher ?? (async (
+    aggregate,
+    eventId
+  ) => {
+    const secretKey = config.pushplus.secretKey;
+    if (secretKey === undefined) {
+      throw new PushPlusImageError("access_key", "invalid");
+    }
+    const rendered = await renderUsageChartPng(env.BROWSER, aggregate);
+    console.log(JSON.stringify({
+      event: "usage_chart_png_rendered",
+      eventId,
+      browserMs: rendered.browserMs
+    }));
+    return await uploadPushPlusPng({
+      token: config.pushplus.token,
+      secretKey
+    }, rendered.bytes);
+  });
 
   try {
   if (scheduledNotAfter !== undefined && clock() >= scheduledNotAfter) {
@@ -672,13 +704,15 @@ export async function runBroadcast(
         []
       );
       let targetEvent = textOnlyEvent;
-      let usageChartSnapshots: UsageChartSnapshotWrite[] = [];
       if (usageView.status === "available") {
         try {
-          const chartUrl = await createUsageChartUrl(
-            config.usageChart,
+          const chartUrl = await chartImagePublisher(
+            usageView.aggregate,
             textOnlyEvent.id
           );
+          if (!isPushPlusPictureUrl(chartUrl)) {
+            throw new PushPlusImageError("upload", "invalid");
+          }
           const richUsageView: UsageDetailsView = {
             status: "available",
             aggregate: usageView.aggregate,
@@ -696,15 +730,18 @@ export async function runBroadcast(
             notAfter,
             []
           );
-          usageChartSnapshots = [{
-            id: targetEvent.id,
-            observedAt: usageView.aggregate.observedAt,
-            chartJson: serializeUsageChartData(usageView.aggregate),
-            createdAt: clock()
-          }];
-        } catch {
+        } catch (error) {
           targetEvent = textOnlyEvent;
-          usageChartSnapshots = [];
+          const stage = error instanceof UsageChartPngError
+            ? "png"
+            : error instanceof PushPlusImageError
+              ? error.stage
+              : "publish";
+          console.warn(JSON.stringify({
+            event: "usage_chart_image_fallback",
+            eventId: textOnlyEvent.id,
+            stage
+          }));
         }
       }
 
@@ -719,25 +756,11 @@ export async function runBroadcast(
           { key: "runtime", value: runtime, version: commitNow }
         ]
       };
-      try {
-        await repo.commitSnapshotUnderLease({
-          ...commonCommit,
-          events: [...recoveryEvents, targetEvent],
-          usageChartSnapshots
-        });
-      } catch (error) {
-        if (
-          error instanceof LeaseLostError ||
-          usageChartSnapshots.length === 0
-        ) {
-          throw error;
-        }
-        await repo.commitSnapshotUnderLease({
-          ...commonCommit,
-          events: [...recoveryEvents, textOnlyEvent],
-          usageChartSnapshots: []
-        });
-      }
+      await repo.commitSnapshotUnderLease({
+        ...commonCommit,
+        events: [...recoveryEvents, targetEvent],
+        usageChartSnapshots: []
+      });
       const report = await dispatchDue(
         repo,
         config.pushplus,
