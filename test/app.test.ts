@@ -10,12 +10,13 @@ import {
   runScheduled
 } from "../src/app";
 import { SourceError, type QuotaSnapshot, type QuotaSource } from "../src/domain";
+import { PushPlusImageError } from "../src/pushplus-image";
 import {
   LeaseLostError,
   Repository,
   type SnapshotCommit
 } from "../src/repository";
-import type { UsageRecord } from "../src/usage-domain";
+import type { UsageAggregate, UsageRecord } from "../src/usage-domain";
 
 const AT_0900 = Date.parse("2026-08-03T01:00:00.000Z");
 const AT_1000 = Date.parse("2026-08-03T02:00:00.000Z");
@@ -142,7 +143,7 @@ describe("定时广播编排", () => {
     expect(sourceFetch).toHaveBeenCalledTimes(2);
   });
 
-  it("定时额度与明细成功时原子保存同编号事件和图表快照", async () => {
+  it("定时额度与明细成功时使用 PushPlus PNG", async () => {
     const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
     const usageSourceFetch = vi.fn().mockResolvedValue({
       status: "complete" as const,
@@ -163,6 +164,9 @@ describe("定时广播编排", () => {
       {
         source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
         usageSource: { fetch: usageSourceFetch },
+        chartImagePublisher: vi.fn().mockResolvedValue(
+          "https://pic.pushplus.plus/1/usage-chart.png@p"
+        ),
         fetchImpl: vi.fn().mockResolvedValue(
           Response.json({ code: 200, data: "provider-id" })
         ),
@@ -177,15 +181,143 @@ describe("定时广播编排", () => {
     expect(event?.content).toContain("最近 24 小时总 Token：380");
     expect(event?.content).toContain("模型排行：");
     expect(event?.content).toContain("gpt-5");
-    expect(event?.content).toContain(`/charts/usage/${event!.id}.svg?sig=`);
+    expect(event?.content).toContain(
+      "https://pic.pushplus.plus/1/usage-chart.png@p"
+    );
     expect(event?.content).toContain("<img");
     expect(await env.DB.prepare(
-      "SELECT COUNT(*) AS count FROM usage_chart_snapshots WHERE id = ?"
-    ).bind(event!.id).first()).toEqual({ count: 1 });
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
+    ).first()).toEqual({ count: 0 });
     expect(usageSourceFetch).toHaveBeenCalledWith(scheduledAt);
   });
 
-  it("手动广播复用明细图表链路且重复幂等键只投递一次", async () => {
+  it("图片链路超过初始租约时续期后只提交并投递一次", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    let current = occurredAt;
+    const chartImagePublisher = vi.fn(async () => {
+      current += 71_000;
+      return "https://pic.pushplus.plus/1/renewed-usage-chart.png@p";
+    });
+    const pushFetch = vi.fn().mockResolvedValue(
+      Response.json({ code: 200, data: "provider-id" })
+    );
+
+    expect(await runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "renew-long-image-chain"
+      },
+      testEnv(),
+      {
+        source: {
+          fetch: vi.fn(async () => {
+            current += 31_250;
+            return snapshot(20, current);
+          })
+        },
+        usageSource: {
+          fetch: vi.fn(async () => {
+            current += 25_000;
+            return { status: "complete" as const, records: [], pagesRead: 1 };
+          })
+        },
+        chartImagePublisher,
+        fetchImpl: pushFetch,
+        now: () => current
+      }
+    )).toBe("completed");
+
+    expect(current - occurredAt).toBe(127_250);
+    expect(chartImagePublisher).toHaveBeenCalledOnce();
+    expect(pushFetch).toHaveBeenCalledOnce();
+    expect(await env.DB.prepare(
+      "SELECT status, content FROM outbox_events WHERE logical_key = ?"
+    ).bind("broadcast:manual:renew-long-image-chain").first<{
+      status: string;
+      content: string;
+    }>()).toMatchObject({
+      status: "succeeded",
+      content: expect.stringContaining(
+        "https://pic.pushplus.plus/1/renewed-usage-chart.png@p"
+      )
+    });
+  });
+
+  it("图片发布前续租失败时不上传提交或投递", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const renew = vi.spyOn(Repository.prototype, "renewSnapshotLease")
+      .mockResolvedValue(false);
+    const commit = vi.spyOn(Repository.prototype, "commitSnapshotUnderLease");
+    const chartImagePublisher = vi.fn().mockResolvedValue(
+      "https://pic.pushplus.plus/1/must-not-publish.png@p"
+    );
+    const pushFetch = vi.fn();
+
+    await expect(runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "renew-before-publish-lost"
+      },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "complete",
+            records: [],
+            pagesRead: 1
+          })
+        },
+        chartImagePublisher,
+        fetchImpl: pushFetch,
+        now: () => occurredAt
+      }
+    )).rejects.toBeInstanceOf(LeaseLostError);
+
+    expect(renew).toHaveBeenCalledOnce();
+    expect(chartImagePublisher).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+    expect(pushFetch).not.toHaveBeenCalled();
+  });
+
+  it("明细不可用时提交前续租失败不提交或投递", async () => {
+    const occurredAt = Date.parse("2026-08-05T02:30:00Z");
+    const renew = vi.spyOn(Repository.prototype, "renewSnapshotLease")
+      .mockResolvedValue(false);
+    const commit = vi.spyOn(Repository.prototype, "commitSnapshotUnderLease");
+    const chartImagePublisher = vi.fn();
+    const pushFetch = vi.fn();
+
+    await expect(runBroadcast(
+      {
+        type: "manual",
+        occurredAt,
+        idempotencyDigest: "renew-unavailable-lost"
+      },
+      testEnv(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "unavailable",
+            reason: "not-authorized"
+          })
+        },
+        chartImagePublisher,
+        fetchImpl: pushFetch,
+        now: () => occurredAt
+      }
+    )).rejects.toBeInstanceOf(LeaseLostError);
+
+    expect(renew).toHaveBeenCalledOnce();
+    expect(chartImagePublisher).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+    expect(pushFetch).not.toHaveBeenCalled();
+  });
+
+  it("同一手动幂等键只发布并投递一次 PNG", async () => {
     const occurredAt = Date.parse("2026-08-05T02:30:00Z");
     const usageSourceFetch = vi.fn().mockResolvedValue({
       status: "complete" as const,
@@ -195,6 +327,9 @@ describe("定时广播编排", () => {
     const pushFetch = vi.fn().mockResolvedValue(
       Response.json({ code: 200, data: "provider-id" })
     );
+    const chartImagePublisher = vi.fn().mockResolvedValue(
+      "https://pic.pushplus.plus/1/manual-usage-chart.png@p"
+    );
     const trigger = {
       type: "manual" as const,
       occurredAt,
@@ -203,6 +338,7 @@ describe("定时广播编排", () => {
     const deps = {
       source: { fetch: vi.fn().mockResolvedValue(snapshot(20, occurredAt)) },
       usageSource: { fetch: usageSourceFetch },
+      chartImagePublisher,
       fetchImpl: pushFetch,
       now: () => occurredAt
     };
@@ -217,11 +353,14 @@ describe("定时广播编排", () => {
       content: string;
     }>();
     expect(event?.content).toContain("最近 24 小时");
-    expect(event?.content).toContain(`/charts/usage/${event!.id}.svg?sig=`);
+    expect(event?.content).toContain(
+      "https://pic.pushplus.plus/1/manual-usage-chart.png@p"
+    );
     expect(await env.DB.prepare(
-      "SELECT COUNT(*) AS count FROM usage_chart_snapshots WHERE id = ?"
-    ).bind(event!.id).first()).toEqual({ count: 1 });
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
+    ).first()).toEqual({ count: 0 });
     expect(usageSourceFetch).toHaveBeenCalledOnce();
+    expect(chartImagePublisher).toHaveBeenCalledOnce();
     expect(pushFetch).toHaveBeenCalledOnce();
   });
 
@@ -277,8 +416,13 @@ describe("定时广播编排", () => {
     }
   );
 
-  it("合法空明细显示零汇总并保存零值图表", async () => {
+  it("合法空明细显示零汇总并发布零值 PNG", async () => {
     const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+    let publishedAggregate: UsageAggregate | undefined;
+    const chartImagePublisher = vi.fn(async (aggregate: UsageAggregate) => {
+      publishedAggregate = aggregate;
+      return "https://pic.pushplus.plus/1/empty-usage-chart.png@p";
+    });
 
     expect(await runBroadcast(
       { type: "scheduled", occurredAt: scheduledAt },
@@ -292,6 +436,7 @@ describe("定时广播编排", () => {
             pagesRead: 1
           })
         },
+        chartImagePublisher,
         fetchImpl: vi.fn().mockResolvedValue(
           Response.json({ code: 200, data: "provider-id" })
         ),
@@ -305,12 +450,10 @@ describe("定时广播编排", () => {
     expect(event?.content).toContain("最近 24 小时请求数：0");
     expect(event?.content).toContain("最近 24 小时总 Token：0");
     expect(event?.content).toContain("暂无模型记录");
-    const chart = await env.DB.prepare(
-      "SELECT chart_json FROM usage_chart_snapshots WHERE id = ?"
-    ).bind(event!.id).first<{ chart_json: string }>();
-    const buckets = (JSON.parse(chart!.chart_json) as {
-      buckets: Array<Record<string, number>>;
-    }).buckets;
+    expect(event?.content).toContain(
+      "https://pic.pushplus.plus/1/empty-usage-chart.png@p"
+    );
+    const buckets = publishedAggregate!.buckets;
     expect(buckets).toHaveLength(24);
     expect(buckets.every((bucket) =>
       bucket.inputTokens === 0 &&
@@ -318,6 +461,9 @@ describe("定时广播编排", () => {
       bucket.reasoningTokens === 0 &&
       bucket.cacheTokens === 0
     )).toBe(true);
+    expect(await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
+    ).first()).toEqual({ count: 0 });
   });
 
   it("明细采集跨过定时槽位边界时跳过旧整点且不创建事件或快照", async () => {
@@ -355,7 +501,7 @@ describe("定时广播编排", () => {
     ).first()).toEqual({ count: 0 });
   });
 
-  it("富消息图表事务失败时用同一事件编号回退文字明细", async () => {
+  it("图片发布失败时单次提交完整文字且不泄露异常", async () => {
     const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
     const originalCommit = Repository.prototype.commitSnapshotUnderLease;
     const commits: SnapshotCommit[] = [];
@@ -365,17 +511,12 @@ describe("定时广播编排", () => {
         input: SnapshotCommit
       ) {
         commits.push(input);
-        const sabotaged = input.usageChartSnapshots.length === 0
-          ? input
-          : {
-              ...input,
-              usageChartSnapshots: input.usageChartSnapshots.map((item) => ({
-                ...item,
-                chartJson: "{"
-              }))
-            };
-        await originalCommit.call(this, sabotaged);
+        await originalCommit.call(this, input);
       });
+    const sensitiveError = new PushPlusImageError("upload", "rejected");
+    sensitiveError.message = "不得记录的敏感标记";
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const chartImagePublisher = vi.fn().mockRejectedValue(sensitiveError);
 
     expect(await runBroadcast(
       { type: "scheduled", occurredAt: scheduledAt },
@@ -389,6 +530,7 @@ describe("定时广播编排", () => {
             pagesRead: 1
           })
         },
+        chartImagePublisher,
         fetchImpl: vi.fn().mockResolvedValue(
           Response.json({ code: 200, data: "provider-id" })
         ),
@@ -396,10 +538,8 @@ describe("定时广播编排", () => {
       }
     )).toBe("completed");
 
-    expect(commits).toHaveLength(2);
-    expect(commits[0]!.usageChartSnapshots).toHaveLength(1);
-    expect(commits[1]!.usageChartSnapshots).toHaveLength(0);
-    expect(commits[0]!.events.at(-1)!.id).toBe(commits[1]!.events.at(-1)!.id);
+    expect(commits).toHaveLength(1);
+    expect(commits[0]!.usageChartSnapshots).toHaveLength(0);
     const event = await env.DB.prepare(
       "SELECT id, content FROM outbox_events WHERE kind = 'daily'"
     ).first<{ id: string; content: string }>();
@@ -410,21 +550,26 @@ describe("定时广播编排", () => {
     expect(await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
     ).first()).toEqual({ count: 0 });
+    expect(warning).toHaveBeenCalledWith(JSON.stringify({
+      event: "usage_chart_image_fallback",
+      eventId: event!.id,
+      stage: "upload"
+    }));
+    expect(warning.mock.calls.flat().join(" ")).not.toContain("不得记录的敏感标记");
   });
 
-  it("富消息提交失去租约时继续抛出且不重试文字事件", async () => {
+  it("图片发布成功后失去租约时不二次提交或投递", async () => {
     const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
-    const originalCommit = Repository.prototype.commitSnapshotUnderLease;
     let commitCalls = 0;
     vi.spyOn(Repository.prototype, "commitSnapshotUnderLease")
-      .mockImplementation(async function (
-        this: Repository,
-        input: SnapshotCommit
-      ) {
+      .mockImplementation(async () => {
         commitCalls += 1;
-        if (input.usageChartSnapshots.length > 0) throw new LeaseLostError();
-        await originalCommit.call(this, input);
+        throw new LeaseLostError();
       });
+    const chartImagePublisher = vi.fn().mockResolvedValue(
+      "https://pic.pushplus.plus/1/lease-lost-chart.png@p"
+    );
+    const pushFetch = vi.fn();
 
     await expect(runBroadcast(
       { type: "scheduled", occurredAt: scheduledAt },
@@ -438,12 +583,15 @@ describe("定时广播编排", () => {
             pagesRead: 1
           })
         },
-        fetchImpl: vi.fn(),
+        chartImagePublisher,
+        fetchImpl: pushFetch,
         now: () => scheduledAt
       }
     )).rejects.toBeInstanceOf(LeaseLostError);
 
     expect(commitCalls).toBe(1);
+    expect(chartImagePublisher).toHaveBeenCalledOnce();
+    expect(pushFetch).not.toHaveBeenCalled();
     expect(await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM outbox_events"
     ).first()).toEqual({ count: 0 });

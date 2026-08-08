@@ -120,6 +120,21 @@ export class Repository {
     return result.meta.changes === 1;
   }
 
+  async renewSnapshotLease(
+    owner: string,
+    now: number,
+    leaseMs: number
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        "UPDATE locks SET lease_until = ? " +
+        "WHERE name = 'snapshot' AND owner = ? AND lease_until > ?"
+      )
+      .bind(now + leaseMs, owner, now)
+      .run();
+    return result.meta.changes === 1;
+  }
+
   async releaseSnapshotLease(owner: string): Promise<void> {
     await this.db
       .prepare(
