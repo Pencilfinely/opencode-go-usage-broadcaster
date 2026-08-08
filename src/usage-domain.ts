@@ -78,5 +78,5 @@ export type UsageUnavailableReason =
   | "schema";
 
 export type UsageDetailsView =
-  | { status: "available"; aggregate: UsageAggregate; chartUrl?: string }
+  | { status: "available"; aggregate: UsageAggregate }
   | { status: "unavailable"; reason: UsageUnavailableReason };
