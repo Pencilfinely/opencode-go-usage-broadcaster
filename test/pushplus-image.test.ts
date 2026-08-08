@@ -253,7 +253,16 @@ describe("PushPlus 图片上传客户端", () => {
         { token: "token", secretKey: "secret" }, validPng(), fetchImpl
       );
       const rejected = expect(pending).rejects.toThrow(expectedError);
-      await vi.advanceTimersByTimeAsync(timeoutMs);
+      let settled = false;
+      void pending.then(
+        () => { settled = true; },
+        () => { settled = true; }
+      );
+      await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+
+      expect(signal?.aborted).toBe(false);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
 
       expect(signal?.aborted).toBe(true);
       await rejected;
@@ -272,6 +281,24 @@ describe("PushPlus 图片上传客户端", () => {
         png,
         fetchSequence([accessKeyResponse(), uploadTokenResponse(), uploadResponse(png)])
       )).resolves.toBe("https://pic.pushplus.plus/1/chart.png@p");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("在计时器触发前的网络失败后清理阶段计时器", async () => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      signal = init?.signal ?? undefined;
+      throw new Error("连接失败");
+    };
+    try {
+      await expect(uploadPushPlusPng(
+        { token: "token", secretKey: "secret" }, validPng(), fetchImpl
+      )).rejects.toThrow("pushplus_image_access_key_network");
+      expect(signal?.aborted).toBe(false);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
