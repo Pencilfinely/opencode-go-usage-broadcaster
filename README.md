@@ -73,26 +73,6 @@ git diff --check
 
 每条广播生成的图表 URL 是一个带签名的 SVG 链接。Worker 只接受 `GET`、精确路径和签名参数，并拒绝带 Cookie 或 `Authorization` 的请求；因此它不是账户登录页，但任何拿到完整签名链接的人都可在快照保留期内查看该图表。链接只包含聚合图表数据，不含原始记录或会话凭据。预览 alias 必须公开，且不能启用 Cloudflare Access，否则微信客户端无法匿名读取 SVG。
 
-## PushPlus PNG 图表
-
-新广播会将 720×360 用量图表转为 PNG，上传至 PushPlus 官方图片服务后写入消息；图片服务当前为收费能力，会员可限时免费使用。启用前请确认当前 PushPlus 账号具有图片上传权限；没有权限或图片生成、鉴权、上传失败时，Worker 会自动发送完整文字内容，不会因此中断本次广播。
-
-现有 `PUSHPLUS_TOKEN` 必须是 PushPlus 开放接口所要求的用户 Token，不能使用消息 Token；获取 AccessKey 时需要前者。
-
-在 PushPlus 的“开发设置”中完成以下配置：
-
-1. 开启开放接口。
-2. 设置至少 32 位的随机 `SecretKey`。
-3. 关闭 IP 白名单。普通 Cloudflare Worker 没有固定出口 IP，无法可靠地通过固定 IP 白名单访问开放接口。
-
-然后用交互式命令把同一个密钥写入 Worker Secret：
-
-```powershell
-npx wrangler secret put PUSHPLUS_SECRET_KEY
-```
-
-不要把密钥作为命令参数传入，也不要写入仓库、配置文件或日志。纯 local 环境不支持 Browser Run Quick Action；实际图片验证应使用远程预览版本或已部署版本。历史消息的签名 SVG 会继续保留，最长不超过原有的 30 天清理周期。
-
 ## 严格的预览验收顺序
 
 以下是远程操作说明，必须按顺序执行；本地检查不能替代这些门槛。命令中的 Secret 均通过安全输入或临时变量提供，不能用真实值替换后保存到任何文件。
@@ -101,7 +81,7 @@ npx wrangler secret put PUSHPLUS_SECRET_KEY
 2. 先对远程 D1 应用 migration，再安全地创建 `USAGE_CHART_SIGNING_SECRET`；随后运行 `npx wrangler versions upload --dry-run`。`wrangler versions secret put` 只创建新版本，不会移动 preview alias。
 3. 第一次上传必须带 `--preview-alias usage-chart`、预览 `PUBLIC_BASE_URL` 和预览标签。确认 alias 对外公开、没有 Cloudflare Access。
 4. 在同一 PowerShell 会话运行 `npm run auth:setup -- --version-only`，完成一次 GitHub 登录；若希望保存并在以后复用登录状态，则改用上面的 `--profile` 命令。工具从新建空白页访问 `/workspace/<工作区>/go`，再通过站内导航进入 `/workspace/<工作区>/usage`。默认临时 profile 会被清理，调用方提供的 profile 会保留。两次上传之间暂停 CI 和其他发布。
-5. 再次执行 `npx wrangler versions upload --preview-alias usage-chart`，并再次传入预览 `PUBLIC_BASE_URL`，使 alias 移到含新会话包的版本；只核对最终 alias 版本的 Secret 名称完整包含 `PUSHPLUS_TOKEN`、`PUSHPLUS_SECRET_KEY`、`PUSHPLUS_TOPIC`、`PUSHPLUS_CALLBACK_SECRET`、`PUSHPLUS_CALLBACK_BASE_URL`、`MANUAL_TRIGGER_SECRET`、`OPENCODE_SESSION_BUNDLE` 与 `USAGE_CHART_SIGNING_SECRET`，不要读取或打印 Secret 值。
+5. 再次执行 `npx wrangler versions upload --preview-alias usage-chart`，并再次传入预览 `PUBLIC_BASE_URL`，使 alias 移到含新会话包的版本；只核对最终 alias 版本的 Secret 名称完整包含 `PUSHPLUS_TOKEN`、`PUSHPLUS_TOPIC`、`PUSHPLUS_CALLBACK_SECRET`、`PUSHPLUS_CALLBACK_BASE_URL`、`MANUAL_TRIGGER_SECRET`、`OPENCODE_SESSION_BUNDLE` 与 `USAGE_CHART_SIGNING_SECRET`，不要读取或打印 Secret 值。
 6. 仅向预览 alias 的 `/admin/manual-trigger` 发起一次带安全输入的 `MANUAL_TRIGGER_SECRET` 和唯一幂等键的请求，确认响应为 204。不要用 GitHub 生产工作流替代该验收。
 7. 远程预览阶段只验证 Worker 行为，不触发真实 PushPlus 广播，也不声称微信端验收已完成；图片和微信详情页的真实烟测必须等待 PR 合并后的部署阶段。
 8. 上述远程预览检查通过后才可推送分支并创建中文、非草稿 PR。PR 只能陈述实际完成的验证；合并后再在主分支运行 `npm run check`、配置生产 Secret、部署并执行真实烟测。
@@ -110,7 +90,6 @@ npx wrangler secret put PUSHPLUS_SECRET_KEY
 
 生产配置保持 `PUBLIC_BASE_URL` 为生产根地址，Cron 为 `0 1-15 * * *`（UTC），即北京时间每日 09:00 至 23:00。手动触发、定时广播和三项额度仍沿用原有规则；新增明细和图表始终是可降级的附加内容。
 
-PR 合并后才进行真实烟测：先在 PushPlus 开发设置确认图片上传权限、开放接口、至少 32 位随机 `SecretKey` 和已关闭的 IP 白名单；再通过交互式 `npx wrangler secret put PUSHPLUS_SECRET_KEY` 写入同一密钥，部署 Worker 后手动触发一次广播。应在 PushPlus 微信详情页确认三项额度和完整文字内容可见，且成功图片的主机为 `pic.pushplus.plus`。如果 PNG 不可用，应确认完整文字降级仍可送达；不要反复触发，先修复账户或配置问题。
 
 本地启动开发服务：
 

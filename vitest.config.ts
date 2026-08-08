@@ -18,7 +18,6 @@ export default defineConfig(async () => {
             TEST_MIGRATIONS: migrations,
             PUSHPLUS_TOKEN: "test-token",
             PUSHPLUS_TOPIC: "test-topic",
-            PUSHPLUS_SECRET_KEY: "test-pushplus-secret-key-32-bytes-minimum",
             PUSHPLUS_CALLBACK_SECRET: "test-callback-secret-32-bytes-minimum",
             PUSHPLUS_CALLBACK_BASE_URL: "https://worker.test",
             USAGE_CHART_SIGNING_SECRET: "test-usage-chart-signing-secret-32-bytes-minimum"

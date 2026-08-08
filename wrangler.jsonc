@@ -4,9 +4,6 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-03",
   "preview_urls": true,
-  "browser": {
-    "binding": "BROWSER"
-  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -29,7 +26,6 @@
     "required": [
       "PUSHPLUS_TOKEN",
       "PUSHPLUS_TOPIC",
-      "PUSHPLUS_SECRET_KEY",
       "PUSHPLUS_CALLBACK_SECRET",
       "PUSHPLUS_CALLBACK_BASE_URL",
       "MANUAL_TRIGGER_SECRET",
