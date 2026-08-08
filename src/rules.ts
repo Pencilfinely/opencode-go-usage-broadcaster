@@ -212,7 +212,7 @@ export function renderInlineUsageChart(aggregate: UsageAggregate): string[] {
     const filled = total === 0 || maximum === 0
       ? 0
       : Math.min(10, Math.max(1, Math.ceil(total / maximum * 10)));
-    return inlineHourFormat.format(new Date(bucket.startAt)) + "时" +
+    return inlineHourFormat.format(new Date(bucket.startAt)) + "时 " +
       "█".repeat(filled) + "░".repeat(10 - filled) + " " +
       formatInteger(total) + " Token";
   });

@@ -182,27 +182,27 @@ describe("quota rules", () => {
     expect(message.content).toContain("至少 48");
     expect(message.content).toContain("至少 $1.2346");
     expect(message.content).toContain("仅含已采集的最新记录");
-    expect(message.content.match(/\d{2}时░{10} 0 Token/g)).toHaveLength(24);
+    expect(message.content.match(/\d{2}时 ░{10} 0 Token/g)).toHaveLength(24);
   });
 
   it("将二十四个北京时间小时桶渲染为按最大值缩放的内嵌条形图", () => {
     const startAt = Date.UTC(2026, 7, 7, 16);
     const buckets = Array.from({ length: 24 }, (_, index) => ({
       startAt: startAt + index * 60 * 60 * 1000,
-      inputTokens: index === 0 ? 100 : index === 1 ? 1 : 0,
-      outputTokens: 0,
-      reasoningTokens: 0,
-      cacheTokens: 0
+      inputTokens: index === 0 ? 40 : index === 1 ? 1 : 0,
+      outputTokens: index === 0 ? 30 : 0,
+      reasoningTokens: index === 0 ? 20 : 0,
+      cacheTokens: index === 0 ? 10 : 0
     }));
     const message = renderBroadcastMessage(snapshot(49, 20, 10), "event-inline", true, {
       status: "available",
       aggregate: aggregate({ buckets })
     });
 
-    expect(message.content).toContain("00时██████████ 100 Token");
-    expect(message.content).toContain("01时█░░░░░░░░░ 1 Token");
-    expect(message.content).toContain("02时░░░░░░░░░░ 0 Token");
-    expect(message.content.match(/\d{2}时[█░]{10} [\d,]+ Token/g)).toHaveLength(24);
+    expect(message.content).toContain("00时 ██████████ 100 Token");
+    expect(message.content).toContain("01时 █░░░░░░░░░ 1 Token");
+    expect(message.content).toContain("02时 ░░░░░░░░░░ 0 Token");
+    expect(message.content.match(/\d{2}时 [█░]{10} [\d,]+ Token/g)).toHaveLength(24);
     expect(message.content).not.toContain("<img");
   });
 
