@@ -5,6 +5,7 @@ import {
   type WindowKey
 } from "./domain";
 import type {
+  UsageAggregate,
   UsageDetailsView,
   UsageModelTotal,
   UsageUnavailableReason
@@ -178,8 +179,6 @@ function escapeHtmlText(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-const escapeHtmlAttribute = escapeHtmlText;
-
 const USAGE_UNAVAILABLE_COPY: Record<UsageUnavailableReason, string> = {
   "not-authorized": "24 小时明细尚未授权，请重新运行授权工具。",
   "single-page-full": "24 小时明细分页尚未授权，请重新运行授权工具。",
@@ -194,6 +193,29 @@ const numberFormat = new Intl.NumberFormat("zh-CN", {
 
 function formatInteger(value: number): string {
   return numberFormat.format(value);
+}
+
+const inlineHourFormat = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Shanghai",
+  hour: "2-digit",
+  hourCycle: "h23"
+});
+
+export function renderInlineUsageChart(aggregate: UsageAggregate): string[] {
+  const totals = aggregate.buckets.map((bucket) =>
+    bucket.inputTokens + bucket.outputTokens +
+    bucket.reasoningTokens + bucket.cacheTokens
+  );
+  const maximum = Math.max(0, ...totals);
+  return aggregate.buckets.map((bucket, index) => {
+    const total = totals[index] ?? 0;
+    const filled = total === 0 || maximum === 0
+      ? 0
+      : Math.min(10, Math.max(1, Math.ceil(total / maximum * 10)));
+    return inlineHourFormat.format(new Date(bucket.startAt)) + "时 " +
+      "█".repeat(filled) + "░".repeat(10 - filled) + " " +
+      formatInteger(total) + " Token";
+  });
 }
 
 function formatQualified(value: string, truncated: boolean): string {
@@ -235,17 +257,10 @@ function renderUsageDetails(usageDetails: UsageDetailsView): string[] {
         "$" + (aggregate.costMicroCents / 100000000).toFixed(4),
         aggregate.truncated
       ),
-    "模型排行：" + formatModels(aggregate.models, aggregate.truncated)
+    "模型排行：" + formatModels(aggregate.models, aggregate.truncated),
+    "最近 24 小时每小时 Token：",
+    ...renderInlineUsageChart(aggregate)
   ];
-  if (usageDetails.chartUrl) {
-    rows.push(
-      '<img src="' +
-        escapeHtmlAttribute(usageDetails.chartUrl) +
-        '" alt="最近 24 小时 Token 分层图" style="max-width:100%;height:auto">'
-    );
-  } else {
-    rows.push("图表暂不可用，文字汇总不受影响。");
-  }
   if (aggregate.truncated) rows.push("图表仅含已采集的最新记录。");
   return rows;
 }

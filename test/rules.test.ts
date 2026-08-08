@@ -151,6 +151,7 @@ describe("quota rules", () => {
   });
 
   it("转义模型名并以至少标识截断汇总", () => {
+    const startAt = Date.UTC(2026, 7, 7, 16);
     const message = renderBroadcastMessage(snapshot(49, 20, 10), "event-1", false, {
       status: "available",
       aggregate: aggregate({
@@ -164,6 +165,13 @@ describe("quota rules", () => {
           cacheTokens: 15,
           totalTokens: 48
         },
+        buckets: Array.from({ length: 24 }, (_, index) => ({
+          startAt: startAt + index * 60 * 60 * 1000,
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cacheTokens: 0
+        })),
         models: [{ model: "<img src=x>", tokenCount: 48, sharePercent: 100 }]
       })
     });
@@ -174,21 +182,34 @@ describe("quota rules", () => {
     expect(message.content).toContain("至少 48");
     expect(message.content).toContain("至少 $1.2346");
     expect(message.content).toContain("仅含已采集的最新记录");
+    expect(message.content.match(/\d{2}时 ░{10} 0 Token/g)).toHaveLength(24);
   });
 
-  it("在文字汇总降级时保留零值且只渲染一个安全图表", () => {
-    const withoutAccess = renderBroadcastMessage(snapshot(49, 20, 10), "event-2", true);
-    const withChart = renderBroadcastMessage(snapshot(49, 20, 10), "event-3", true, {
+  it("将二十四个北京时间小时桶渲染为按最大值缩放的内嵌条形图", () => {
+    const startAt = Date.UTC(2026, 7, 7, 16);
+    const buckets = Array.from({ length: 24 }, (_, index) => ({
+      startAt: startAt + index * 60 * 60 * 1000,
+      inputTokens: index === 0 ? 40 : index === 1 ? 1 : 0,
+      outputTokens: index === 0 ? 30 : 0,
+      reasoningTokens: index === 0 ? 20 : 0,
+      cacheTokens: index === 0 ? 10 : 0
+    }));
+    const message = renderBroadcastMessage(snapshot(49, 20, 10), "event-inline", true, {
       status: "available",
-      aggregate: aggregate(),
-      chartUrl: "https://example.test/chart.svg?a=1&b=2"
+      aggregate: aggregate({ buckets })
     });
+
+    expect(message.content).toContain("00时 ██████████ 100 Token");
+    expect(message.content).toContain("01时 █░░░░░░░░░ 1 Token");
+    expect(message.content).toContain("02时 ░░░░░░░░░░ 0 Token");
+    expect(message.content.match(/\d{2}时 [█░]{10} [\d,]+ Token/g)).toHaveLength(24);
+    expect(message.content).not.toContain("<img");
+  });
+
+  it("在文字汇总降级时保留零值", () => {
+    const withoutAccess = renderBroadcastMessage(snapshot(49, 20, 10), "event-2", true);
 
     expect(withoutAccess.content).toContain("24 小时明细尚未授权");
     expect(withoutAccess.content).not.toContain("<img");
-    expect(withChart.content).toContain("请求数：0");
-    expect(withChart.content).toContain("总 Token：0");
-    expect(withChart.content.match(/<img /g)).toHaveLength(1);
-    expect(withChart.content).toContain("a=1&amp;b=2");
   });
 });

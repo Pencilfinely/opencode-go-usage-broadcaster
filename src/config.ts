@@ -9,7 +9,6 @@ export interface AppConfig {
   sessionBundle?: string;
   pushplus: {
     token: string;
-    secretKey?: string;
     topic: string;
     callbackSecret: string;
     callbackBaseUrl: string;
@@ -78,11 +77,6 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     throw new Error("PUSHPLUS_CALLBACK_SECRET must be at least 32 characters");
   }
 
-  const pushplusSecretKey = bindings.PUSHPLUS_SECRET_KEY;
-  if (pushplusSecretKey !== undefined && pushplusSecretKey.length < 32) {
-    throw new Error("PUSHPLUS_SECRET_KEY must be at least 32 characters");
-  }
-
   const manualTriggerSecret = required(
     bindings.MANUAL_TRIGGER_SECRET,
     "MANUAL_TRIGGER_SECRET"
@@ -128,7 +122,6 @@ export function loadConfig(env: Cloudflare.Env): AppConfig {
     ...(sessionBundle === undefined ? {} : { sessionBundle }),
     pushplus: {
       token: required(bindings.PUSHPLUS_TOKEN, "PUSHPLUS_TOKEN"),
-      ...(pushplusSecretKey === undefined ? {} : { secretKey: pushplusSecretKey }),
       topic: required(bindings.PUSHPLUS_TOPIC, "PUSHPLUS_TOPIC"),
       callbackSecret,
       callbackBaseUrl: callbackBase.origin
