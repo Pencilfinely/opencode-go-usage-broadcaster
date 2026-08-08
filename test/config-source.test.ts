@@ -68,6 +68,7 @@ function makeEnv(overrides: ConfigBindingOverrides = {}): Cloudflare.Env {
     OPENCODE_AUTH_GENERATION: "1",
     PUSHPLUS_TOKEN: "test-token",
     PUSHPLUS_TOPIC: "test-topic",
+    PUSHPLUS_SECRET_KEY: "test-pushplus-secret-key-32-bytes-minimum",
     PUSHPLUS_CALLBACK_SECRET: "test-callback-secret-32-bytes-minimum",
     PUSHPLUS_CALLBACK_BASE_URL: "https://worker.test",
     MANUAL_TRIGGER_SECRET: "test-manual-trigger-secret-32-bytes-minimum",
@@ -104,6 +105,18 @@ function makeV2SessionBundle(): string {
 }
 
 describe("quota source boundary", () => {
+  it("允许未配置图片密钥，但拒绝过短图片密钥", () => {
+    const validEnv = makeEnv();
+    expect(loadConfig({
+      ...validEnv,
+      PUSHPLUS_SECRET_KEY: undefined
+    } as unknown as Cloudflare.Env).pushplus.secretKey).toBeUndefined();
+    expect(() => loadConfig({
+      ...validEnv,
+      PUSHPLUS_SECRET_KEY: "short"
+    } as unknown as Cloudflare.Env)).toThrow("at least 32 characters");
+  });
+
   it("版本 2 使用会话代次并可创建两类来源", async () => {
     const config = loadConfig(makeEnv({
       USAGE_SOURCE: "opencode-console",
