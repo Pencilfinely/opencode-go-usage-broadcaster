@@ -1,5 +1,5 @@
-const ACCESS_KEY_URL = "https://www.pushplus.plus/api/upload/getAccessKey";
-const UPLOAD_TOKEN_URL = "https://www.pushplus.plus/api/upload/getUploadToken";
+const ACCESS_KEY_URL = "https://www.pushplus.plus/api/common/openApi/getAccessKey";
+const UPLOAD_TOKEN_URL = "https://www.pushplus.plus/api/open/userImage/uploadToken";
 const QINIU_UPLOAD_URL = "https://upload.qiniup.com/";
 const PICTURE_HOST = "pic.pushplus.plus";
 const MAX_PNG_BYTES = 2 * 1024 * 1024;

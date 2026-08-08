@@ -109,12 +109,12 @@ describe("PushPlus 图片上传客户端", () => {
 
     expect(requests).toHaveLength(3);
     expect(requests[0]).toMatchObject({
-      input: "https://www.pushplus.plus/api/upload/getAccessKey",
+      input: "https://www.pushplus.plus/api/common/openApi/getAccessKey",
       init: { method: "POST", redirect: "error" }
     });
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({ token: "token", secretKey: "secret" });
     expect(requests[1]).toMatchObject({
-      input: "https://www.pushplus.plus/api/upload/getUploadToken",
+      input: "https://www.pushplus.plus/api/open/userImage/uploadToken",
       init: { method: "GET", redirect: "error", headers: { "access-key": "a".repeat(32) } }
     });
     expect(requests[2]).toMatchObject({
