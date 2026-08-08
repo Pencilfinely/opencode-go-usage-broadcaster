@@ -54,6 +54,16 @@ function fetchSequence(responses: Response[]): typeof fetch {
   };
 }
 
+function responseWithHangingBody(signal: AbortSignal): Response {
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      signal.addEventListener("abort", () => {
+        controller.error(new DOMException("请求已中止", "AbortError"));
+      }, { once: true });
+    }
+  }));
+}
+
 describe("PushPlus 图片上传客户端", () => {
   it("依照官方三步边界上传 PNG 并返回受信任的图片地址", async () => {
     const png = validPng();
@@ -214,6 +224,57 @@ describe("PushPlus 图片上传客户端", () => {
       expect(errorSpy.mock.calls.flat().join(" ")).not.toContain(marker);
     } finally {
       errorSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ["AccessKey", [], 8_000, "pushplus_image_access_key_network"],
+    ["上传凭证", [accessKeyResponse()], 8_000, "pushplus_image_upload_token_network"],
+    ["七牛上传", [accessKeyResponse(), uploadTokenResponse()], 15_000, "pushplus_image_upload_network"]
+  ] as const)("在%s响应头已返回但正文挂起时于规定总时限中止", async (
+    _stage,
+    completedResponses,
+    timeoutMs,
+    expectedError
+  ) => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    const responses = [...completedResponses];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const response = responses.shift();
+      if (response) return response;
+      signal = init?.signal ?? undefined;
+      if (!signal) throw new Error("测试未收到中止信号");
+      return responseWithHangingBody(signal);
+    };
+
+    try {
+      const pending = uploadPushPlusPng(
+        { token: "token", secretKey: "secret" }, validPng(), fetchImpl
+      );
+      const rejected = expect(pending).rejects.toThrow(expectedError);
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+
+      expect(signal?.aborted).toBe(true);
+      await rejected;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("在三步上传成功完成后清理全部阶段计时器", async () => {
+    vi.useFakeTimers();
+    try {
+      const png = validPng();
+      await expect(uploadPushPlusPng(
+        { token: "token", secretKey: "secret" },
+        png,
+        fetchSequence([accessKeyResponse(), uploadTokenResponse(), uploadResponse(png)])
+      )).resolves.toBe("https://pic.pushplus.plus/1/chart.png@p");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

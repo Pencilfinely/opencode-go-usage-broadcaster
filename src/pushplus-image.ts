@@ -41,25 +41,47 @@ function isPng(png: Uint8Array): boolean {
     png[4] === 0x0d && png[5] === 0x0a && png[6] === 0x1a && png[7] === 0x0a;
 }
 
-async function fetchWithTimeout(
+async function fetchWithTimeout<T>(
   fetchImpl: typeof fetch,
   input: RequestInfo | URL,
   init: RequestInit,
   timeoutMs: number,
-  stage: PushPlusImageStage
-): Promise<Response> {
+  stage: PushPlusImageStage,
+  handleResponse: (response: Response, signal: AbortSignal) => Promise<T>
+): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetchImpl(input, { ...init, signal: controller.signal });
-  } catch {
+    const response = await fetchImpl(input, { ...init, signal: controller.signal });
+    return await handleResponse(response, controller.signal);
+  } catch (error) {
+    if (error instanceof PushPlusImageError) throw error;
     return fail(stage, "network");
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function readBoundedJson(response: Response, stage: PushPlusImageStage): Promise<unknown> {
+function readWithAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal,
+  stage: PushPlusImageStage
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal.aborted) return Promise.reject(new PushPlusImageError(stage, "network"));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new PushPlusImageError(stage, "network"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+async function readBoundedJson(
+  response: Response,
+  stage: PushPlusImageStage,
+  signal: AbortSignal
+): Promise<unknown> {
   const declaredLength = response.headers.get("content-length");
   if (declaredLength !== null) {
     const length = Number(declaredLength);
@@ -74,7 +96,7 @@ async function readBoundedJson(response: Response, stage: PushPlusImageStage): P
   let total = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithAbort(reader, signal, stage);
       if (done) break;
       total += value.byteLength;
       if (total > MAX_JSON_BYTES) {
@@ -106,49 +128,51 @@ function requireSuccessResponse(response: Response, stage: PushPlusImageStage): 
 }
 
 async function getAccessKey(config: PushPlusImageConfig, fetchImpl: typeof fetch): Promise<string> {
-  const response = await fetchWithTimeout(fetchImpl, ACCESS_KEY_URL, {
+  return fetchWithTimeout(fetchImpl, ACCESS_KEY_URL, {
     method: "POST",
     redirect: "error",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ token: config.token, secretKey: config.secretKey })
-  }, 8_000, "access_key");
-  requireSuccessResponse(response, "access_key");
-  const payload = await readBoundedJson(response, "access_key");
-  if (!isRecord(payload)) {
-    fail("access_key", "invalid");
-  }
-  if (payload.code !== 200) fail("access_key", "rejected");
-  if (!isRecord(payload.data)) fail("access_key", "invalid");
-  const { accessKey, expiresIn } = payload.data;
-  if (typeof accessKey !== "string" || accessKey.length < 32 || accessKey.length > 512 || !isPositiveSafeInteger(expiresIn)) {
-    fail("access_key", "invalid");
-  }
-  return accessKey;
+  }, 8_000, "access_key", async (response, signal) => {
+    requireSuccessResponse(response, "access_key");
+    const payload = await readBoundedJson(response, "access_key", signal);
+    if (!isRecord(payload)) {
+      fail("access_key", "invalid");
+    }
+    if (payload.code !== 200) fail("access_key", "rejected");
+    if (!isRecord(payload.data)) fail("access_key", "invalid");
+    const { accessKey, expiresIn } = payload.data;
+    if (typeof accessKey !== "string" || accessKey.length < 32 || accessKey.length > 512 || !isPositiveSafeInteger(expiresIn)) {
+      fail("access_key", "invalid");
+    }
+    return accessKey;
+  });
 }
 
 async function getUploadToken(accessKey: string, fetchImpl: typeof fetch): Promise<string> {
-  const response = await fetchWithTimeout(fetchImpl, UPLOAD_TOKEN_URL, {
+  return fetchWithTimeout(fetchImpl, UPLOAD_TOKEN_URL, {
     method: "GET",
     redirect: "error",
     headers: { "access-key": accessKey }
-  }, 8_000, "upload_token");
-  requireSuccessResponse(response, "upload_token");
-  const payload = await readBoundedJson(response, "upload_token");
-  if (!isRecord(payload)) {
-    fail("upload_token", "invalid");
-  }
-  if (payload.code !== 200) fail("upload_token", "rejected");
-  if (!isRecord(payload.data)) fail("upload_token", "invalid");
-  const { uploadToken, uploadUrl, bucket, expiresIn } = payload.data;
-  if (
-    typeof uploadToken !== "string" || uploadToken.length === 0 || uploadToken.length > MAX_UPLOAD_TOKEN_LENGTH ||
-    uploadUrl !== QINIU_UPLOAD_URL ||
-    typeof bucket !== "string" || bucket.length === 0 || bucket.length > 512 ||
-    !isPositiveSafeInteger(expiresIn)
-  ) {
-    fail("upload_token", "invalid");
-  }
-  return uploadToken;
+  }, 8_000, "upload_token", async (response, signal) => {
+    requireSuccessResponse(response, "upload_token");
+    const payload = await readBoundedJson(response, "upload_token", signal);
+    if (!isRecord(payload)) {
+      fail("upload_token", "invalid");
+    }
+    if (payload.code !== 200) fail("upload_token", "rejected");
+    if (!isRecord(payload.data)) fail("upload_token", "invalid");
+    const { uploadToken, uploadUrl, bucket, expiresIn } = payload.data;
+    if (
+      typeof uploadToken !== "string" || uploadToken.length === 0 || uploadToken.length > MAX_UPLOAD_TOKEN_LENGTH ||
+      uploadUrl !== QINIU_UPLOAD_URL ||
+      typeof bucket !== "string" || bucket.length === 0 || bucket.length > 512 ||
+      !isPositiveSafeInteger(expiresIn)
+    ) {
+      fail("upload_token", "invalid");
+    }
+    return uploadToken;
+  });
 }
 
 function validImageUrl(value: unknown): value is string {
@@ -168,18 +192,19 @@ async function uploadPng(uploadToken: string, png: Uint8Array, fetchImpl: typeof
   const form = new FormData();
   form.append("token", uploadToken);
   form.append("file", new Blob([copy.buffer], { type: "image/png" }), "usage-chart.png");
-  const response = await fetchWithTimeout(fetchImpl, QINIU_UPLOAD_URL, {
+  return fetchWithTimeout(fetchImpl, QINIU_UPLOAD_URL, {
     method: "POST",
     redirect: "error",
     body: form
-  }, 15_000, "upload");
-  requireSuccessResponse(response, "upload");
-  const payload = await readBoundedJson(response, "upload");
-  if (!isRecord(payload) || payload.errno !== 0 || payload.mimeType !== "image/png" ||
-    payload.fsize !== png.byteLength || !validImageUrl(payload.url)) {
-    fail("upload", "invalid");
-  }
-  return payload.url;
+  }, 15_000, "upload", async (response, signal) => {
+    requireSuccessResponse(response, "upload");
+    const payload = await readBoundedJson(response, "upload", signal);
+    if (!isRecord(payload) || payload.errno !== 0 || payload.mimeType !== "image/png" ||
+      payload.fsize !== png.byteLength || !validImageUrl(payload.url)) {
+      fail("upload", "invalid");
+    }
+    return payload.url;
+  });
 }
 
 export async function uploadPushPlusPng(
