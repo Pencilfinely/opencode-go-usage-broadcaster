@@ -85,9 +85,9 @@ function miniBarItem(content: string, hour: string): string {
 }
 
 function quotaItem(content: string, key: DashboardQuotaRow["key"]): string {
-  const marker = `data-quota="${key}"`;
+  const marker = `<table data-quota="${key}"`;
   const start = content.indexOf(marker);
-  const nextQuota = content.indexOf("data-quota=", start + marker.length);
+  const nextQuota = content.indexOf("<table data-quota=", start + marker.length);
   const end = nextQuota === -1 ? content.indexOf("</tbody>", start) : nextQuota;
   return content.slice(start, end === -1 ? content.length : end);
 }
@@ -129,6 +129,35 @@ describe("PushPlus 仪表盘外壳", () => {
     expect(content).not.toContain('data-section="token-breakdown"');
     expect(content).not.toContain('data-section="hourly-exact"');
     expect(content).not.toContain('data-section="models"');
+  });
+
+  it("每项额度的进度条独占下一整行，不与文字和百分比争抢宽度", () => {
+    const content = renderUsageDashboardHtml(
+      availableInput(completeAggregate())
+    );
+    const rolling = quotaItem(content, "rolling");
+
+    expect(rolling).toMatch(
+      /<table data-quota="rolling"[^>]*>[\s\S]*?<tr data-quota-meta="rolling">/
+    );
+    expect(rolling).toMatch(
+      /<tr data-quota-bar-row="rolling"><td colspan="2" data-quota-track="rolling"/
+    );
+
+    const meta = rolling.match(
+      /<tr data-quota-meta="rolling">[\s\S]*?<\/tr>/
+    )?.[0] ?? "";
+    const bar = rolling.match(
+      /<tr data-quota-bar-row="rolling">[\s\S]*?<\/tr>/
+    )?.[0] ?? "";
+
+    expect(meta).toContain("5 小时额度");
+    expect(meta).toContain('data-quota-reset="rolling"');
+    expect(meta).toContain('data-quota-percent="rolling"');
+    expect(meta).not.toContain('data-quota-track="rolling"');
+    expect(bar).toContain('data-quota-track="rolling"');
+    expect(bar).not.toContain('data-quota-percent="rolling"');
+    expect(bar).not.toContain('data-quota-reset="rolling"');
   });
 
   it("为轨道和填充单元格同时提供兼容背景色", () => {

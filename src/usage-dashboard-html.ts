@@ -209,7 +209,7 @@ function renderQuotaRow(row: DashboardQuotaRow): string {
   const rest = percent === 100
     ? ""
     : `<td data-quota-remaining="${key}" width="${remaining}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"></td>`;
-  return `<tr data-quota="${key}"><td>${escapeHtmlText(row.label)}<br><span data-quota-reset="${key}" style="color:#6b7280;font-size:12px">重置：${escapeHtmlText(row.resetText)}</span></td><td data-quota-track="${key}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><table width="100%" height="8" role="presentation" cellspacing="0" cellpadding="0"><tr>${fill}${rest}</tr></table></td><td data-quota-percent="${key}" align="right" nowrap style="white-space:nowrap">${progress}</td></tr>`;
+  return `<tr><td><table data-quota="${key}" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr data-quota-meta="${key}"><td>${escapeHtmlText(row.label)}<br><span data-quota-reset="${key}" style="color:#6b7280;font-size:12px">重置：${escapeHtmlText(row.resetText)}</span></td><td data-quota-percent="${key}" align="right" nowrap style="white-space:nowrap">${progress}</td></tr><tr data-quota-bar-row="${key}"><td colspan="2" data-quota-track="${key}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><table width="100%" height="8" role="presentation" cellspacing="0" cellpadding="0"><tr>${fill}${rest}</tr></table></td></tr></table></td></tr>`;
 }
 
 function renderDashboardVariant(
