@@ -102,7 +102,6 @@ function costValue(costMicroCents: number, truncated: boolean): string {
 
 interface HourValue {
   hour: string;
-  rawValue: number;
   displayValue: string;
   miniPercent: number;
 }
@@ -114,7 +113,6 @@ function hourlyValues(aggregate: UsageAggregate): HourValue[] {
     const rawValue = totals[index] ?? 0;
     return {
       hour: hourFormat.format(new Date(bucket.startAt)),
-      rawValue,
       displayValue: integerFormat.format(rawValue),
       miniPercent: miniBarPercent(rawValue, maximum)
     };
@@ -150,30 +148,24 @@ function renderTokenBreakdown(aggregate: UsageAggregate): string {
 }
 
 function renderHourValue(value: HourValue, includeMiniBar: boolean): string {
-  if (!includeMiniBar) {
-    return `<table data-hour-value="${value.hour}" width="100%"><tr><td width="30%" nowrap>${value.hour}</td><td width="70%" align="right" nowrap>${value.displayValue}</td></tr></table>`;
-  }
-
   const fillStyle = value.miniPercent === 0
     ? ""
     : ' bgcolor="#2563eb" style="background-color:#2563eb"';
   const remainingPercent = 100 - value.miniPercent;
-  const miniBar = `<table data-mini-bar="${value.hour}" width="100%" height="6" cellspacing="0" cellpadding="0" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
-  return `<table data-hour-value="${value.hour}" width="100%"><tr><td width="15%" nowrap>${value.hour}</td><td width="45%">${miniBar}</td><td width="40%" align="right" nowrap>${value.displayValue}</td></tr></table>`;
+  const miniBar = `<table data-mini-bar="${value.hour}" width="100%" height="6" bgcolor="#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
+  const miniBarRow = includeMiniBar
+    ? `<tr data-mini-bar-row="${value.hour}"><td colspan="2">${miniBar}</td></tr>`
+    : "";
+  return `<table data-hour-value="${value.hour}"><tr data-hour-meta="${value.hour}"><td>${value.hour}</td><td width="70%" align="right" style="white-space:normal;word-break:break-all">${value.displayValue}</td></tr>${miniBarRow}</table>`;
 }
 
 function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant): string {
   const values = hourlyValues(aggregate);
-  const single = values.some((value) => value.displayValue.length > 10);
   const includeMiniBar = variant === "rich";
-  const rows = single
-    ? values.map((value) => `<tr><td>${renderHourValue(value, includeMiniBar)}</td></tr>`).join("")
-    : Array.from({ length: 12 }, (_, index) =>
-      `<tr><td>${renderHourValue(values[index]!, includeMiniBar)}</td><td>${renderHourValue(values[index + 12]!, includeMiniBar)}</td></tr>`
-    ).join("");
-  const layout = single ? "single" : "double";
-  const titleColspan = single ? 1 : 2;
-  return `<table data-section="hourly-exact" data-hour-layout="${layout}" width="100%" role="presentation" cellspacing="0" cellpadding="2"><tr><td colspan="${titleColspan}"><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
+  const rows = values.map((value) =>
+    `<tr data-hour-row="${value.hour}"><td>${renderHourValue(value, includeMiniBar)}</td></tr>`
+  ).join("");
+  return `<table data-section="hourly-exact" data-hour-layout="single" width="100%" role="presentation" cellspacing="0" cellpadding="2"><tr><td><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
 }
 
 function renderModels(aggregate: UsageAggregate): string {

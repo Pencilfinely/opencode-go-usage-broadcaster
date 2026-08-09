@@ -6,12 +6,7 @@ import {
 } from "../src/usage-dashboard-html";
 import type { UsageAggregate, UsageHourBucket } from "../src/usage-domain";
 
-const DOUBLE_HOUR_ORDER = [
-  "00", "12", "01", "13", "02", "14", "03", "15", "04", "16", "05", "17",
-  "06", "18", "07", "19", "08", "20", "09", "21", "10", "22", "11", "23"
-];
-
-const SINGLE_HOUR_ORDER = [
+const HOUR_ORDER = [
   "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11",
   "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23"
 ];
@@ -192,8 +187,14 @@ describe("最终审查回归", () => {
     const axisHours = [...content.matchAll(
       /data-hour-axis="(?:0|6|12|18)"[^>]*>(\d{2})<\/td>/g
     )].map((match) => match[1]);
+    const exactHours = [...content.matchAll(/data-hour-row="(\d{2})"/g)]
+      .map((match) => match[1]);
 
     expect(axisHours).toEqual(["20", "02", "08", "14"]);
+    expect(exactHours).toEqual([
+      "20", "21", "22", "23", "00", "01", "02", "03", "04", "05", "06", "07",
+      "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"
+    ]);
   });
 
   it("精确值迷你条使用固定轨道和互补的填充与剩余单元格", () => {
@@ -248,13 +249,32 @@ describe("最终审查回归", () => {
     expect(chart).not.toContain("&nbsp;");
   });
 
-  it("精确值区显示标题并为小时、条和右对齐数值设置兼容列", () => {
+  it("普通长度的 24 小时精确值也逐小时独占单列", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const hours = [...content.matchAll(/data-hour-row="(\d{2})"/g)]
+      .map((match) => match[1]);
+
+    expect(content).toContain("24 小时精确值（Token）");
+    expect(content).toContain('data-hour-layout="single"');
+    expect(hours).toEqual(HOUR_ORDER);
+    expect(content.match(/data-hour-row=/g)).toHaveLength(24);
+    expect(content).not.toContain('data-hour-layout="double"');
+
+    for (const hour of HOUR_ORDER) {
+      const item = hourItem(content, hour);
+      expect(item).toContain(`data-mini-bar-row="${hour}"`);
+      expect(item).toMatch(/<td colspan="2">[\s\S]*?data-mini-bar=/);
+    }
+  });
+
+  it("精确数值允许只在自身单元格内换行", () => {
     const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
     const firstHour = hourItem(content, "00");
 
-    expect(content).toContain("24 小时精确值（Token）");
-    expect(firstHour).toMatch(/<tr><td width="15%" nowrap>00<\/td><td width="45%">/);
-    expect(firstHour).toMatch(/<td width="40%" align="right" nowrap>100<\/td>/);
+    expect(firstHour).toMatch(
+      /<td[^>]*align="right"[^>]*style="[^"]*white-space:normal[^"]*"[^>]*>100<\/td>/
+    );
+    expect(firstHour).not.toMatch(/align="right"[^>]*nowrap/);
   });
 
   it("截断数据同时保留部分小时口径和截断提示", () => {
@@ -290,12 +310,12 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(content).toContain("输出");
     expect(content).toContain("推理");
     expect(content).toContain("缓存");
-    expect(content).toContain('data-hour-layout="double"');
+    expect(content).toContain('data-hour-layout="single"');
     expect(content.match(/data-hour-value=/g)).toHaveLength(24);
 
     const hourValues = [...content.matchAll(/data-hour-value="(\d{2})"/g)]
       .map((match) => match[1]);
-    expect(hourValues).toEqual(DOUBLE_HOUR_ORDER);
+    expect(hourValues).toEqual(HOUR_ORDER);
     expect(hourItem(content, "00")).toContain(">100</td>");
     expect(hourItem(content, "01")).toContain(">1</td>");
     expect(hourItem(content, "02")).toContain(">0</td>");
@@ -347,8 +367,8 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(content).toContain("$0.0000");
     expect(content.match(/data-hour-bar="\d{2}"[^>]*height:0/g)).toHaveLength(24);
     expect([...content.matchAll(/data-hour-value="(\d{2})"/g)].map((match) => match[1]))
-      .toEqual(DOUBLE_HOUR_ORDER);
-    const zeroHourItems = DOUBLE_HOUR_ORDER.map((hour) => hourItem(content, hour));
+      .toEqual(HOUR_ORDER);
+    const zeroHourItems = HOUR_ORDER.map((hour) => hourItem(content, hour));
     expect(zeroHourItems).toHaveLength(24);
     expect(zeroHourItems.every((item) => item.includes(">0</td>"))).toBe(true);
     const zeroBars = content.match(/<td data-hour-bar="\d{2}"[^>]*>.*?<\/td>/g) ?? [];
@@ -403,7 +423,7 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(rich).toContain("9,007,199,254,740,991");
     expect(rich).toContain('data-hour-layout="single"');
     expect([...rich.matchAll(/data-hour-value="(\d{2})"/g)].map((match) => match[1]))
-      .toEqual(SINGLE_HOUR_ORDER);
+      .toEqual(HOUR_ORDER);
     expect(rich).toContain("甲".repeat(64));
     expect(rich).toContain("乙".repeat(63) + "…");
     expect(rich).toContain("&lt;img src=x&gt;");
@@ -422,6 +442,8 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(compatible).not.toContain('data-section="hourly-chart"');
     expect(compatible).not.toContain("data-mini-bar=");
     expect(compatible.match(/data-hour-value=/g)).toHaveLength(24);
+    expect(compatible.match(/data-hour-row="\d{2}"/g)).toHaveLength(24);
+    expect(compatible).not.toContain("data-mini-bar-row=");
     expect(compatible).toContain("9,007,199,254,740,991");
     expect(compatible).toContain("&lt;img src=x&gt;");
     expect(compatible).not.toContain("<img src=x>");
