@@ -78,6 +78,26 @@ function hourItem(content: string, hour: string): string {
   return content.slice(start, end === -1 ? content.length : end);
 }
 
+function miniBarItem(content: string, hour: string): string {
+  return content.match(new RegExp(
+    `<table data-mini-bar="${hour}"[\\s\\S]*?<\\/table>`
+  ))?.[0] ?? "";
+}
+
+function quotaItem(content: string, key: DashboardQuotaRow["key"]): string {
+  const marker = `data-quota="${key}"`;
+  const start = content.indexOf(marker);
+  const nextQuota = content.indexOf("data-quota=", start + marker.length);
+  const end = nextQuota === -1 ? content.indexOf("</tbody>", start) : nextQuota;
+  return content.slice(start, end === -1 ? content.length : end);
+}
+
+function hourlyChartItem(content: string): string {
+  const start = content.indexOf('data-section="hourly-chart"');
+  const end = content.indexOf('data-section="token-breakdown"', start);
+  return content.slice(start, end === -1 ? content.length : end);
+}
+
 describe("PushPlus 仪表盘外壳", () => {
   it("渲染额度进度、未授权说明和安全页脚", () => {
     const quotaRows: DashboardQuotaRow[] = [
@@ -131,6 +151,100 @@ describe("PushPlus 仪表盘外壳", () => {
   });
 });
 
+describe("最终审查回归", () => {
+  it("趋势轴按跨日桶的第 0、6、12、18 项显示真实小时", () => {
+    const aggregate = completeAggregate();
+    aggregate.buckets = aggregate.buckets.map((bucket, index) => ({
+      ...bucket,
+      startAt: Date.UTC(2026, 7, 8, 12) + index * 60 * 60 * 1000
+    }));
+
+    const content = renderUsageDashboardHtml(availableInput(aggregate));
+    const axisHours = [...content.matchAll(
+      /data-hour-axis="(?:0|6|12|18)"[^>]*>(\d{2})<\/td>/g
+    )].map((match) => match[1]);
+
+    expect(axisHours).toEqual(["20", "02", "08", "14"]);
+  });
+
+  it("精确值迷你条使用固定轨道和互补的填充与剩余单元格", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const full = miniBarItem(content, "00");
+    const small = miniBarItem(content, "01");
+    const zero = miniBarItem(content, "02");
+
+    expect(full).toMatch(/^<table data-mini-bar="00" width="100%" height="6"/);
+    expect(full).toMatch(/<tr><td width="100%"[^>]*bgcolor="#2563eb"[^>]*><\/td><td width="0%"[^>]*><\/td><\/tr>/);
+    expect(small).toMatch(/<tr><td width="1%"[^>]*bgcolor="#2563eb"[^>]*><\/td><td width="99%"[^>]*><\/td><\/tr>/);
+    expect(zero).toMatch(/<tr><td width="0%"[^>]*><\/td><td width="100%"[^>]*><\/td><\/tr>/);
+    expect(zero).not.toContain("#2563eb");
+    expect(full + small + zero).not.toContain("&nbsp;");
+  });
+
+  it("顶部额度条在零和满格边界不渲染空段并兼容显示百分比", () => {
+    const input = availableInput(completeAggregate());
+    input.quotaRows = [
+      { key: "rolling", label: "5 小时额度", usedPercent: 0, resetText: "08月9日 14:00" },
+      { key: "weekly", label: "每周额度", usedPercent: 100, resetText: "08月10日 08:00" },
+      { key: "monthly", label: "每月额度", usedPercent: 50, resetText: "09月1日 08:00" }
+    ];
+
+    const content = renderUsageDashboardHtml(input);
+    const empty = quotaItem(content, "rolling");
+    const full = quotaItem(content, "weekly");
+    const half = quotaItem(content, "monthly");
+
+    expect(empty).not.toContain('data-quota-progress="rolling"');
+    expect(empty).toMatch(/data-quota-remaining="rolling" width="100%"/);
+    expect(empty).not.toMatch(/bgcolor="#2563eb"|background-color:#2563eb/);
+    expect(full).toMatch(/data-quota-progress="weekly" width="100%"[^>]*bgcolor="#2563eb"/);
+    expect(full).not.toContain('data-quota-remaining="weekly"');
+    expect(half).toMatch(/data-quota-progress="monthly" width="50%"/);
+    expect(half).toMatch(/data-quota-remaining="monthly" width="50%"/);
+    expect(empty).toContain('<table width="100%" height="8"');
+    expect(full).toContain('<table width="100%" height="8"');
+    expect(content).toMatch(/data-quota-percent="rolling" align="right" nowrap[^>]*>0%<\/td>/);
+    expect(content).toMatch(/data-quota-percent="weekly" align="right" nowrap[^>]*>100%<\/td>/);
+    expect(content).toMatch(/data-quota-reset="rolling"[^>]*color:#6b7280/);
+    expect(empty + full + half).not.toContain("&nbsp;");
+  });
+
+  it("小时柱单元格保持空内容且嵌套表格归零间距", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const chart = hourlyChartItem(content);
+    const barCells = chart.match(/<td data-hour-bar="\d{2}"[^>]*><\/td>/g) ?? [];
+
+    expect(barCells).toHaveLength(24);
+    expect(chart).toMatch(/<table width="100%" cellspacing="0" cellpadding="0"><tr><td data-hour-bar="01"/);
+    expect(chart).not.toContain("&nbsp;");
+  });
+
+  it("精确值区显示标题并为小时、条和右对齐数值设置兼容列", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const firstHour = hourItem(content, "00");
+
+    expect(content).toContain("24 小时精确值（Token）");
+    expect(firstHour).toMatch(/<tr><td width="15%" nowrap>00<\/td><td width="45%">/);
+    expect(firstHour).toMatch(/<td width="40%" align="right" nowrap>100<\/td>/);
+  });
+
+  it("截断数据同时保留部分小时口径和截断提示", () => {
+    const aggregate = completeAggregate();
+    aggregate.truncated = true;
+
+    const content = renderUsageDashboardHtml(availableInput(aggregate));
+
+    expect(content).toContain("当前小时为部分小时，仅统计至观察时间。");
+    expect(content).toContain("仅含已采集的最新记录。");
+  });
+
+  it("丰富版不注入未约定的字体族", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+
+    expect(content).not.toMatch(/font-family/i);
+  });
+});
+
 describe("PushPlus 完整用量仪表盘", () => {
   it("渲染完整数据、零值和安全边界", () => {
     const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
@@ -153,9 +267,9 @@ describe("PushPlus 完整用量仪表盘", () => {
     const hourValues = [...content.matchAll(/data-hour-value="(\d{2})"/g)]
       .map((match) => match[1]);
     expect(hourValues).toEqual(DOUBLE_HOUR_ORDER);
-    expect(hourItem(content, "00")).toContain("<td>100</td>");
-    expect(hourItem(content, "01")).toContain("<td>1</td>");
-    expect(hourItem(content, "02")).toContain("<td>0</td>");
+    expect(hourItem(content, "00")).toContain(">100</td>");
+    expect(hourItem(content, "01")).toContain(">1</td>");
+    expect(hourItem(content, "02")).toContain(">0</td>");
     expect(hourItem(content, "00")).toContain('data-mini-bar="00"');
     expect(hourItem(content, "00")).toContain('width="100%"');
     expect(hourItem(content, "01")).toContain('data-mini-bar="01"');
@@ -207,17 +321,17 @@ describe("PushPlus 完整用量仪表盘", () => {
       .toEqual(DOUBLE_HOUR_ORDER);
     const zeroHourItems = DOUBLE_HOUR_ORDER.map((hour) => hourItem(content, hour));
     expect(zeroHourItems).toHaveLength(24);
-    expect(zeroHourItems.every((item) => item.includes("<td>0</td>"))).toBe(true);
+    expect(zeroHourItems.every((item) => item.includes(">0</td>"))).toBe(true);
     const zeroBars = content.match(/<td data-hour-bar="\d{2}"[^>]*>.*?<\/td>/g) ?? [];
     expect(zeroBars).toHaveLength(24);
     for (const zeroBar of zeroBars) {
       expect(zeroBar).not.toMatch(/(?:bgcolor|background-color)=/);
       expect(zeroBar).not.toContain("&nbsp;");
     }
-    const zeroMiniBars = content.match(/<table data-mini-bar="\d{2}">[\s\S]*?<\/table>/g) ?? [];
+    const zeroMiniBars = content.match(/<table data-mini-bar="\d{2}"[^>]*>[\s\S]*?<\/table>/g) ?? [];
     expect(zeroMiniBars).toHaveLength(24);
     for (const zeroMiniBar of zeroMiniBars) {
-      expect(zeroMiniBar).not.toMatch(/(?:bgcolor|background-color)=/);
+      expect(zeroMiniBar).not.toContain("#2563eb");
       expect(zeroMiniBar).not.toContain("&nbsp;");
     }
     expect(content).toContain("暂无模型记录");
@@ -280,7 +394,10 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(compatible).not.toContain("data-mini-bar=");
     expect(compatible.match(/data-hour-value=/g)).toHaveLength(24);
     expect(compatible).toContain("9,007,199,254,740,991");
+    expect(compatible).toContain("&lt;img src=x&gt;");
+    expect(compatible).not.toContain("<img src=x>");
     expect(compatible).toContain("事件：event-budget");
+    expect(compatible.length).toBeLessThanOrEqual(DASHBOARD_CONTENT_BUDGET);
 
     const production = renderUsageDashboardHtml(input);
     expect(production.length).toBeLessThanOrEqual(DASHBOARD_CONTENT_BUDGET);

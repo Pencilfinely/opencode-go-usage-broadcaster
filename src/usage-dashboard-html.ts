@@ -133,10 +133,15 @@ function renderHourlyChart(aggregate: UsageAggregate): string {
     const height = barHeight(totals[index] ?? 0, maximum);
     const bar = height === 0
       ? `<td data-hour-bar="${hour}" height="0" style="height:0px"></td>`
-      : `<td data-hour-bar="${hour}" height="${height}" bgcolor="#2563eb" style="height:${height}px;background-color:#2563eb">&nbsp;</td>`;
-    return `<td height="88" valign="bottom"><table><tr>${bar}</tr></table></td>`;
+      : `<td data-hour-bar="${hour}" height="${height}" bgcolor="#2563eb" style="height:${height}px;background-color:#2563eb"></td>`;
+    return `<td height="88" valign="bottom"><table width="100%" cellspacing="0" cellpadding="0"><tr>${bar}</tr></table></td>`;
   }).join("");
-  return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr>${bars}</tr><tr><td colspan="6">00</td><td colspan="6">06</td><td colspan="6">12</td><td colspan="6">18</td></tr></table>`;
+  const axis = [0, 6, 12, 18].map((index) => {
+    const bucket = aggregate.buckets[index];
+    const hour = bucket ? hourFormat.format(new Date(bucket.startAt)) : "";
+    return `<td data-hour-axis="${index}" colspan="6">${hour}</td>`;
+  }).join("");
+  return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr>${bars}</tr><tr>${axis}</tr></table>`;
 }
 
 function renderTokenBreakdown(aggregate: UsageAggregate): string {
@@ -145,10 +150,16 @@ function renderTokenBreakdown(aggregate: UsageAggregate): string {
 }
 
 function renderHourValue(value: HourValue, includeMiniBar: boolean): string {
-  const miniBar = !includeMiniBar ? "" : value.miniPercent === 0
-    ? `<table data-mini-bar="${value.hour}"><tr><td width="0%"></td></tr></table>`
-    : `<table data-mini-bar="${value.hour}"><tr><td width="${value.miniPercent}%" bgcolor="#2563eb" style="background-color:#2563eb">&nbsp;</td></tr></table>`;
-  return `<table data-hour-value="${value.hour}"><tr><td>${value.hour}</td><td>${miniBar}</td><td>${value.displayValue}</td></tr></table>`;
+  if (!includeMiniBar) {
+    return `<table data-hour-value="${value.hour}" width="100%"><tr><td width="30%" nowrap>${value.hour}</td><td width="70%" align="right" nowrap>${value.displayValue}</td></tr></table>`;
+  }
+
+  const fillStyle = value.miniPercent === 0
+    ? ""
+    : ' bgcolor="#2563eb" style="background-color:#2563eb"';
+  const remainingPercent = 100 - value.miniPercent;
+  const miniBar = `<table data-mini-bar="${value.hour}" width="100%" height="6" cellspacing="0" cellpadding="0" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
+  return `<table data-hour-value="${value.hour}" width="100%"><tr><td width="15%" nowrap>${value.hour}</td><td width="45%">${miniBar}</td><td width="40%" align="right" nowrap>${value.displayValue}</td></tr></table>`;
 }
 
 function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant): string {
@@ -161,7 +172,8 @@ function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant)
       `<tr><td>${renderHourValue(values[index]!, includeMiniBar)}</td><td>${renderHourValue(values[index + 12]!, includeMiniBar)}</td></tr>`
     ).join("");
   const layout = single ? "single" : "double";
-  return `<table data-section="hourly-exact" data-hour-layout="${layout}" width="100%" role="presentation" cellspacing="0" cellpadding="2">${rows}</table>`;
+  const titleColspan = single ? 1 : 2;
+  return `<table data-section="hourly-exact" data-hour-layout="${layout}" width="100%" role="presentation" cellspacing="0" cellpadding="2"><tr><td colspan="${titleColspan}"><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
 }
 
 function renderModels(aggregate: UsageAggregate): string {
@@ -189,8 +201,15 @@ function renderAvailableDetails(
 function renderQuotaRow(row: DashboardQuotaRow): string {
   const percent = progressPercent(row.usedPercent);
   const progress = String(percent) + "%";
+  const remaining = String(100 - percent) + "%";
   const key = escapeHtmlText(row.key);
-  return `<tr data-quota="${key}"><td>${escapeHtmlText(row.label)}<br>重置：${escapeHtmlText(row.resetText)}</td><td bgcolor="#e5e7eb" style="background-color:#e5e7eb"><table width="100%" role="presentation" cellspacing="0" cellpadding="0"><tr><td data-quota-progress="${key}" width="${progress}" bgcolor="#2563eb" style="background-color:#2563eb">&nbsp;</td><td bgcolor="#e5e7eb" style="background-color:#e5e7eb">&nbsp;</td></tr></table></td><td>${progress}</td></tr>`;
+  const fill = percent === 0
+    ? ""
+    : `<td data-quota-progress="${key}" width="${progress}" bgcolor="#2563eb" style="background-color:#2563eb"></td>`;
+  const rest = percent === 100
+    ? ""
+    : `<td data-quota-remaining="${key}" width="${remaining}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"></td>`;
+  return `<tr data-quota="${key}"><td>${escapeHtmlText(row.label)}<br><span data-quota-reset="${key}" style="color:#6b7280;font-size:12px">重置：${escapeHtmlText(row.resetText)}</span></td><td data-quota-track="${key}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><table width="100%" height="8" role="presentation" cellspacing="0" cellpadding="0"><tr>${fill}${rest}</tr></table></td><td data-quota-percent="${key}" align="right" nowrap style="white-space:nowrap">${progress}</td></tr>`;
 }
 
 function renderDashboardVariant(
@@ -201,15 +220,16 @@ function renderDashboardVariant(
     "OpenCode Go " + escapeHtmlText(input.statusLabel);
   const quotaRows = input.quotaRows.map(renderQuotaRow).join("");
   const tableStyle = variant === "rich"
-    ? ' style="border-collapse:collapse;font-family:Arial,sans-serif"'
+    ? ' style="border-collapse:collapse"'
     : "";
   const availableDetails = input.usageDetails.status === "available"
     ? renderAvailableDetails(input.usageDetails.aggregate, variant)
     : `<tr><td>${renderUsageDetails(input.usageDetails)}</td></tr>`;
-  const footer = input.usageDetails.status === "available" &&
+  const footer = "当前小时为部分小时，仅统计至观察时间。" +
+    (input.usageDetails.status === "available" &&
     input.usageDetails.aggregate.truncated
-    ? "仅含已采集的最新记录。"
-    : "当前小时为部分小时，仅统计至观察时间。";
+      ? "<br>仅含已采集的最新记录。"
+      : "");
 
   return `<table width="100%"${tableStyle} data-dashboard-variant="${variant}" role="presentation" cellspacing="0" cellpadding="8"><tr><td><strong>${title}</strong></td></tr><tr><td>观察时间：${escapeHtmlText(input.observedAtText)}</td></tr><tr><td><table width="100%" role="presentation" cellspacing="0" cellpadding="6"><tbody>${quotaRows}</tbody></table></td></tr>${availableDetails}<tr><td>观察时间：${escapeHtmlText(input.observedAtText)}<br>${footer}<br>事件：${escapeHtmlText(input.eventId)}</td></tr></table>`;
 }

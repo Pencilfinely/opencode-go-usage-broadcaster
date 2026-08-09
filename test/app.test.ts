@@ -380,7 +380,9 @@ describe("定时广播编排", () => {
     expect(event?.content).toContain("最近 24 小时请求数<br><strong>0</strong>");
     expect(event?.content).toContain("总 Token<br><strong>0</strong>");
     expect(event?.content).toContain("暂无模型记录");
-    expect(event?.content.match(/data-hour-value="\d{2}"[\s\S]*?<td>0<\/td>/g))
+    expect(event?.content.match(
+      /data-hour-value="\d{2}"[\s\S]*?<td width="40%" align="right" nowrap>0<\/td>/g
+    ))
       .toHaveLength(24);
     expect(event?.content).not.toContain("<img");
     expect(event?.content).not.toMatch(/[█░]/);
