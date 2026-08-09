@@ -4,12 +4,8 @@ import {
   type UsageWindow,
   type WindowKey
 } from "./domain";
-import type {
-  UsageAggregate,
-  UsageDetailsView,
-  UsageModelTotal,
-  UsageUnavailableReason
-} from "./usage-domain";
+import { renderUsageDashboardHtml } from "./usage-dashboard-html";
+import type { UsageDetailsView } from "./usage-domain";
 
 export const THRESHOLDS = [50, 75, 90, 100] as const;
 export type Threshold = (typeof THRESHOLDS)[number];
@@ -170,101 +166,6 @@ function prefix(snapshot: QuotaSnapshot): string {
   return snapshot.source === "fixture" ? "【测试数据】" : "";
 }
 
-function escapeHtmlText(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-const USAGE_UNAVAILABLE_COPY: Record<UsageUnavailableReason, string> = {
-  "not-authorized": "24 小时明细尚未授权，请重新运行授权工具。",
-  "single-page-full": "24 小时明细分页尚未授权，请重新运行授权工具。",
-  auth: "24 小时明细登录已失效，请重新运行授权工具。",
-  transient: "24 小时明细暂时不可用，本次额度数据不受影响。",
-  schema: "24 小时明细格式已变化，请更新采集适配器。"
-};
-
-const numberFormat = new Intl.NumberFormat("zh-CN", {
-  maximumFractionDigits: 0
-});
-
-function formatInteger(value: number): string {
-  return numberFormat.format(value);
-}
-
-const inlineHourFormat = new Intl.DateTimeFormat("en-GB", {
-  timeZone: "Asia/Shanghai",
-  hour: "2-digit",
-  hourCycle: "h23"
-});
-
-export function renderInlineUsageChart(aggregate: UsageAggregate): string[] {
-  const totals = aggregate.buckets.map((bucket) =>
-    bucket.inputTokens + bucket.outputTokens +
-    bucket.reasoningTokens + bucket.cacheTokens
-  );
-  const maximum = Math.max(0, ...totals);
-  return aggregate.buckets.map((bucket, index) => {
-    const total = totals[index] ?? 0;
-    const filled = total === 0 || maximum === 0
-      ? 0
-      : Math.min(10, Math.max(1, Math.ceil(total / maximum * 10)));
-    return inlineHourFormat.format(new Date(bucket.startAt)) + "时 " +
-      "█".repeat(filled) + "░".repeat(10 - filled) + " " +
-      formatInteger(total) + " Token";
-  });
-}
-
-function formatQualified(value: string, truncated: boolean): string {
-  return truncated ? "至少 " + value : value;
-}
-
-function formatModels(models: UsageModelTotal[], truncated: boolean): string {
-  if (models.length === 0) return "暂无模型记录";
-  return models.map((model) =>
-    escapeHtmlText(model.model) +
-    "：" +
-    formatQualified(formatInteger(model.tokenCount), truncated) +
-    " Token（" +
-    formatQualified(model.sharePercent.toFixed(1) + "%", truncated) +
-    "）"
-  ).join("；");
-}
-
-function renderUsageDetails(usageDetails: UsageDetailsView): string[] {
-  if (usageDetails.status === "unavailable") {
-    return [USAGE_UNAVAILABLE_COPY[usageDetails.reason]];
-  }
-  const aggregate = usageDetails.aggregate;
-  const rows = [
-    "最近 24 小时请求数：" +
-      formatQualified(formatInteger(aggregate.requestCount), aggregate.truncated),
-    "最近 24 小时总 Token：" +
-      formatQualified(formatInteger(aggregate.tokens.totalTokens), aggregate.truncated),
-    "Token 分类：输入 " +
-      formatQualified(formatInteger(aggregate.tokens.inputTokens), aggregate.truncated) +
-      "；输出 " +
-      formatQualified(formatInteger(aggregate.tokens.outputTokens), aggregate.truncated) +
-      "；推理 " +
-      formatQualified(formatInteger(aggregate.tokens.reasoningTokens), aggregate.truncated) +
-      "；缓存 " +
-      formatQualified(formatInteger(aggregate.tokens.cacheTokens), aggregate.truncated),
-    "费用：" +
-      formatQualified(
-        "$" + (aggregate.costMicroCents / 100000000).toFixed(4),
-        aggregate.truncated
-      ),
-    "模型排行：" + formatModels(aggregate.models, aggregate.truncated),
-    "最近 24 小时每小时 Token：",
-    ...renderInlineUsageChart(aggregate)
-  ];
-  if (aggregate.truncated) rows.push("图表仅含已采集的最新记录。");
-  return rows;
-}
-
 export function renderThresholdMessage(
   snapshot: QuotaSnapshot,
   items: ThresholdItem[],
@@ -335,31 +236,24 @@ export function renderBroadcastMessage(
     reason: "not-authorized"
   }
 ): RenderedMessage {
-  const quotaRows = WINDOW_KEYS.map((key) => {
-    const value = snapshot.windows[key];
-    return (
-      WINDOW_LABELS[key] +
-      ": " +
-      value.usedPercent +
-      "%（重置 " +
-      formatReset(value.resetAt) +
-      "）"
-    );
-  });
-  const observedAt = formatReset(snapshot.observedAt);
+  const quotaRows = WINDOW_KEYS.map((key) => ({
+    key,
+    label: WINDOW_LABELS[key],
+    usedPercent: snapshot.windows[key].usedPercent,
+    resetText: formatReset(snapshot.windows[key].resetAt)
+  }));
+  const statusLabel = manual ? "手动用量" : "整点用量";
+
   return {
-    title: prefix(snapshot) +
-      (manual ? "OpenCode Go 手动用量" : "OpenCode Go 整点用量"),
-    content:
-      prefix(snapshot) +
-      quotaRows
-        .concat(renderUsageDetails(usageDetails))
-        .concat([
-          "观察时间：" + observedAt,
-          "当前小时为部分小时，仅统计至观察时间。",
-          "事件：" + escapeHtmlText(eventId)
-        ])
-        .join("<br>")
+    title: prefix(snapshot) + "OpenCode Go " + statusLabel,
+    content: renderUsageDashboardHtml({
+      testData: snapshot.source === "fixture",
+      statusLabel,
+      observedAtText: formatReset(snapshot.observedAt),
+      quotaRows,
+      usageDetails,
+      eventId
+    })
   };
 }
 

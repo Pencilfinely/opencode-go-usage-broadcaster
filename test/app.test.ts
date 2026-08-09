@@ -173,12 +173,14 @@ describe("定时广播编排", () => {
       "SELECT id, content, status FROM outbox_events WHERE kind = 'daily'"
     ).first<{ id: string; content: string; status: string }>();
     expect(event?.status).toBe("succeeded");
-    expect(event?.content).toContain("最近 24 小时总 Token：380");
-    expect(event?.content).toContain("模型排行：");
+    expect(event?.content).toContain('data-dashboard-variant="rich"');
+    expect(event?.content).toContain('data-section="summary"');
+    expect(event?.content).toContain("<strong>380</strong>");
+    expect(event?.content).toContain('data-section="models"');
     expect(event?.content).toContain("gpt-5");
-    expect(event?.content).toContain("最近 24 小时每小时 Token");
-    expect(event?.content).toContain(" Token");
+    expect(event?.content.match(/data-hour-value=/g)).toHaveLength(24);
     expect(event?.content).not.toContain("<img");
+    expect(event?.content).not.toMatch(/[█░]/);
     expect(event?.content).not.toContain("图表暂不可用");
     expect(await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
@@ -282,9 +284,11 @@ describe("定时广播编排", () => {
       id: string;
       content: string;
     }>();
-    expect(event?.content).toContain("最近 24 小时");
-    expect(event?.content).toContain("最近 24 小时每小时 Token");
+    expect(event?.content).toContain('data-dashboard-variant="rich"');
+    expect(event?.content).toContain('data-section="hourly-exact"');
+    expect(event?.content.match(/data-hour-value=/g)).toHaveLength(24);
     expect(event?.content).not.toContain("<img");
+    expect(event?.content).not.toMatch(/[█░]/);
     expect(await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM outbox_events WHERE kind = 'daily'"
     ).first()).toEqual({ count: 1 });
@@ -372,11 +376,14 @@ describe("定时广播编排", () => {
     const event = await env.DB.prepare(
       "SELECT id, content FROM outbox_events WHERE kind = 'daily'"
     ).first<{ id: string; content: string }>();
-    expect(event?.content).toContain("最近 24 小时请求数：0");
-    expect(event?.content).toContain("最近 24 小时总 Token：0");
+    expect(event?.content).toContain('data-section="summary"');
+    expect(event?.content).toContain("最近 24 小时请求数<br><strong>0</strong>");
+    expect(event?.content).toContain("总 Token<br><strong>0</strong>");
     expect(event?.content).toContain("暂无模型记录");
-    expect(event?.content).toContain("最近 24 小时每小时 Token");
+    expect(event?.content.match(/data-hour-value="\d{2}"[\s\S]*?<td>0<\/td>/g))
+      .toHaveLength(24);
     expect(event?.content).not.toContain("<img");
+    expect(event?.content).not.toMatch(/[█░]/);
     expect(await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM usage_chart_snapshots"
     ).first()).toEqual({ count: 0 });
