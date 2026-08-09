@@ -102,7 +102,6 @@ function costValue(costMicroCents: number, truncated: boolean): string {
 
 interface HourValue {
   hour: string;
-  rawValue: number;
   displayValue: string;
   miniPercent: number;
 }
@@ -114,7 +113,6 @@ function hourlyValues(aggregate: UsageAggregate): HourValue[] {
     const rawValue = totals[index] ?? 0;
     return {
       hour: hourFormat.format(new Date(bucket.startAt)),
-      rawValue,
       displayValue: integerFormat.format(rawValue),
       miniPercent: miniBarPercent(rawValue, maximum)
     };
@@ -132,16 +130,16 @@ function renderHourlyChart(aggregate: UsageAggregate): string {
     const hour = hourFormat.format(new Date(bucket.startAt));
     const height = barHeight(totals[index] ?? 0, maximum);
     const bar = height === 0
-      ? `<td data-hour-bar="${hour}" height="0" style="height:0px"></td>`
+      ? `<td data-hour-bar="${hour}" height="0" style="height:0"></td>`
       : `<td data-hour-bar="${hour}" height="${height}" bgcolor="#2563eb" style="height:${height}px;background-color:#2563eb"></td>`;
-    return `<td height="88" valign="bottom"><table width="100%" cellspacing="0" cellpadding="0"><tr>${bar}</tr></table></td>`;
+    return `<td><table width="100%" cellspacing="0" cellpadding="0"><tr>${bar}</tr></table></td>`;
   }).join("");
   const axis = [0, 6, 12, 18].map((index) => {
     const bucket = aggregate.buckets[index];
     const hour = bucket ? hourFormat.format(new Date(bucket.startAt)) : "";
     return `<td data-hour-axis="${index}" colspan="6">${hour}</td>`;
   }).join("");
-  return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr>${bars}</tr><tr>${axis}</tr></table>`;
+  return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr height="88" valign="bottom">${bars}</tr><tr>${axis}</tr></table>`;
 }
 
 function renderTokenBreakdown(aggregate: UsageAggregate): string {
@@ -150,30 +148,24 @@ function renderTokenBreakdown(aggregate: UsageAggregate): string {
 }
 
 function renderHourValue(value: HourValue, includeMiniBar: boolean): string {
-  if (!includeMiniBar) {
-    return `<table data-hour-value="${value.hour}" width="100%"><tr><td width="30%" nowrap>${value.hour}</td><td width="70%" align="right" nowrap>${value.displayValue}</td></tr></table>`;
-  }
-
   const fillStyle = value.miniPercent === 0
     ? ""
     : ' bgcolor="#2563eb" style="background-color:#2563eb"';
   const remainingPercent = 100 - value.miniPercent;
-  const miniBar = `<table data-mini-bar="${value.hour}" width="100%" height="6" cellspacing="0" cellpadding="0" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
-  return `<table data-hour-value="${value.hour}" width="100%"><tr><td width="15%" nowrap>${value.hour}</td><td width="45%">${miniBar}</td><td width="40%" align="right" nowrap>${value.displayValue}</td></tr></table>`;
+  const miniBar = `<table data-mini-bar="${value.hour}" width=100% height=6 cellspacing=0 cellpadding=0 bgcolor="#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
+  const miniBarRow = includeMiniBar
+    ? `<tr data-mini-bar-row="${value.hour}"><td colspan="2">${miniBar}</td></tr>`
+    : "";
+  return `<table data-hour-value="${value.hour}" width=100% role=presentation cellspacing=0 cellpadding=0><tr data-hour-meta="${value.hour}"><td nowrap>${value.hour}</td><td width="70%" align="right">${value.displayValue}</td></tr>${miniBarRow}</table>`;
 }
 
 function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant): string {
   const values = hourlyValues(aggregate);
-  const single = values.some((value) => value.displayValue.length > 10);
   const includeMiniBar = variant === "rich";
-  const rows = single
-    ? values.map((value) => `<tr><td>${renderHourValue(value, includeMiniBar)}</td></tr>`).join("")
-    : Array.from({ length: 12 }, (_, index) =>
-      `<tr><td>${renderHourValue(values[index]!, includeMiniBar)}</td><td>${renderHourValue(values[index + 12]!, includeMiniBar)}</td></tr>`
-    ).join("");
-  const layout = single ? "single" : "double";
-  const titleColspan = single ? 1 : 2;
-  return `<table data-section="hourly-exact" data-hour-layout="${layout}" width="100%" role="presentation" cellspacing="0" cellpadding="2"><tr><td colspan="${titleColspan}"><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
+  const rows = values.map((value) =>
+    `<tr data-hour-row="${value.hour}"><td>${renderHourValue(value, includeMiniBar)}</td></tr>`
+  ).join("");
+  return `<table data-section="hourly-exact" data-hour-layout="single" width="100%" role="presentation" cellspacing="0" cellpadding="2" style="white-space:normal;word-break:break-all"><tr><td><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
 }
 
 function renderModels(aggregate: UsageAggregate): string {
@@ -209,7 +201,7 @@ function renderQuotaRow(row: DashboardQuotaRow): string {
   const rest = percent === 100
     ? ""
     : `<td data-quota-remaining="${key}" width="${remaining}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"></td>`;
-  return `<tr data-quota="${key}"><td>${escapeHtmlText(row.label)}<br><span data-quota-reset="${key}" style="color:#6b7280;font-size:12px">重置：${escapeHtmlText(row.resetText)}</span></td><td data-quota-track="${key}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><table width="100%" height="8" role="presentation" cellspacing="0" cellpadding="0"><tr>${fill}${rest}</tr></table></td><td data-quota-percent="${key}" align="right" nowrap style="white-space:nowrap">${progress}</td></tr>`;
+  return `<tr><td><table data-quota="${key}" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr data-quota-meta="${key}"><td>${escapeHtmlText(row.label)}<br><span data-quota-reset="${key}" style="color:#6b7280;font-size:12px">重置：${escapeHtmlText(row.resetText)}</span></td><td data-quota-percent="${key}" align="right" nowrap style="white-space:nowrap">${progress}</td></tr><tr data-quota-bar-row="${key}"><td colspan="2" data-quota-track="${key}" bgcolor="#e5e7eb" style="background-color:#e5e7eb"><table width="100%" height="8" role="presentation" cellspacing="0" cellpadding="0"><tr>${fill}${rest}</tr></table></td></tr></table></td></tr>`;
 }
 
 function renderDashboardVariant(
@@ -219,9 +211,7 @@ function renderDashboardVariant(
   const title = (input.testData ? "【测试数据】" : "") +
     "OpenCode Go " + escapeHtmlText(input.statusLabel);
   const quotaRows = input.quotaRows.map(renderQuotaRow).join("");
-  const tableStyle = variant === "rich"
-    ? ' style="border-collapse:collapse"'
-    : "";
+  const tableStyle = "";
   const availableDetails = input.usageDetails.status === "available"
     ? renderAvailableDetails(input.usageDetails.aggregate, variant)
     : `<tr><td>${renderUsageDetails(input.usageDetails)}</td></tr>`;

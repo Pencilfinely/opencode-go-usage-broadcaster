@@ -6,15 +6,134 @@ import {
 } from "../src/usage-dashboard-html";
 import type { UsageAggregate, UsageHourBucket } from "../src/usage-domain";
 
-const DOUBLE_HOUR_ORDER = [
-  "00", "12", "01", "13", "02", "14", "03", "15", "04", "16", "05", "17",
-  "06", "18", "07", "19", "08", "20", "09", "21", "10", "22", "11", "23"
-];
-
-const SINGLE_HOUR_ORDER = [
+const HOUR_ORDER = [
   "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11",
   "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23"
 ];
+
+const DISTINCT_HOUR_VALUES = [
+  1_001, 2_002, 3_003, 4_004, 5_005, 6_006, 7_007, 8_008,
+  9_009, 10_010, 11_011, 12_012, 13_013, 14_014, 15_015, 16_016,
+  17_017, 18_018, 19_019, 20_020, 21_021, 22_022, 23_023, 24_024
+];
+
+const DISTINCT_HOUR_TEXT = [
+  "1,001", "2,002", "3,003", "4,004", "5,005", "6,006",
+  "7,007", "8,008", "9,009", "10,010", "11,011", "12,012",
+  "13,013", "14,014", "15,015", "16,016", "17,017", "18,018",
+  "19,019", "20,020", "21,021", "22,022", "23,023", "24,024"
+];
+
+type ScannedTableElement = {
+  tag: "table" | "tbody" | "tr" | "td";
+  openTag: string;
+  innerHtml: string;
+  outerHtml: string;
+  children: ScannedTableElement[];
+};
+
+type PendingTableElement = ScannedTableElement & {
+  contentStart: number;
+  start: number;
+};
+
+function requiredItem<T>(items: readonly T[], index: number, description: string): T {
+  const item = items[index];
+  if (item === undefined) {
+    throw new Error(`缺少${description}：索引 ${index}`);
+  }
+  return item;
+}
+
+function scanTableElements(content: string): ScannedTableElement[] {
+  const roots: ScannedTableElement[] = [];
+  const stack: PendingTableElement[] = [];
+  const tags = content.matchAll(/<\/?(table|tbody|tr|td)\b[^>]*>/gi);
+
+  for (const match of tags) {
+    const capturedTag = match[1];
+    const position = match.index;
+    if (capturedTag === undefined || position === undefined) {
+      throw new Error("表格标签扫描结果缺少标签名或位置");
+    }
+    const tag = capturedTag.toLowerCase() as ScannedTableElement["tag"];
+    const token = match[0];
+    if (!token.startsWith("</")) {
+      const element: PendingTableElement = {
+        tag,
+        openTag: token,
+        innerHtml: "",
+        outerHtml: "",
+        children: [],
+        contentStart: position + token.length,
+        start: position
+      };
+      const parent = stack.at(-1);
+      if (parent) {
+        parent.children.push(element);
+      } else {
+        roots.push(element);
+      }
+      stack.push(element);
+      continue;
+    }
+
+    const element = stack.pop();
+    if (!element || element.tag !== tag) {
+      throw new Error(`表格标签未平衡：${token}`);
+    }
+    element.innerHtml = content.slice(element.contentStart, position);
+    element.outerHtml = content.slice(element.start, position + token.length);
+  }
+
+  if (stack.length > 0) {
+    throw new Error(`表格标签未闭合：${stack.at(-1)?.openTag ?? ""}`);
+  }
+  return roots;
+}
+
+function attributeValue(element: ScannedTableElement, name: string): string | undefined {
+  const attributes = element.openTag.matchAll(/([\w-]+)=(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g);
+  for (const attribute of attributes) {
+    if (attribute[1] === name) {
+      return attribute[2] ?? attribute[3] ?? attribute[4];
+    }
+  }
+  return undefined;
+}
+
+function taggedTable(content: string, name: string, value: string): ScannedTableElement {
+  const tables = scanTableElements(content).flatMap(function collect(
+    element: ScannedTableElement
+  ): ScannedTableElement[] {
+    return [element, ...element.children.flatMap(collect)];
+  }).filter((element) => element.tag === "table");
+  const table = tables.find((element) => attributeValue(element, name) === value);
+  if (!table) {
+    throw new Error(`找不到表格：${name}=${value}`);
+  }
+  return table;
+}
+
+function directChildren(
+  element: ScannedTableElement,
+  tag: ScannedTableElement["tag"]
+): ScannedTableElement[] {
+  return element.children.filter((child) => child.tag === tag);
+}
+
+function directTableRows(table: ScannedTableElement): ScannedTableElement[] {
+  return table.children.flatMap((child) => {
+    if (child.tag === "tr") {
+      return [child];
+    }
+    return child.tag === "tbody" ? directChildren(child, "tr") : [];
+  });
+}
+
+function directRowCells(row: ScannedTableElement): ScannedTableElement[] {
+  return directChildren(row, "td");
+}
 
 function hourlyBuckets(values: readonly number[]): UsageHourBucket[] {
   return values.map((value, index) => ({
@@ -85,9 +204,9 @@ function miniBarItem(content: string, hour: string): string {
 }
 
 function quotaItem(content: string, key: DashboardQuotaRow["key"]): string {
-  const marker = `data-quota="${key}"`;
+  const marker = `<table data-quota="${key}"`;
   const start = content.indexOf(marker);
-  const nextQuota = content.indexOf("data-quota=", start + marker.length);
+  const nextQuota = content.indexOf("<table data-quota=", start + marker.length);
   const end = nextQuota === -1 ? content.indexOf("</tbody>", start) : nextQuota;
   return content.slice(start, end === -1 ? content.length : end);
 }
@@ -97,6 +216,18 @@ function hourlyChartItem(content: string): string {
   const end = content.indexOf('data-section="token-breakdown"', start);
   return content.slice(start, end === -1 ? content.length : end);
 }
+
+describe("表格直接层级扫描器", () => {
+  it("不会把嵌套双项同排误判为两个直接小时行", () => {
+    const nestedDoubleItem = `<table data-section="hourly-exact"><tr data-hour-row="00"><td><table data-hour-value="00"><tr data-hour-meta="00"><td>00</td><td>1</td></tr></table></td><td><table data-hour-value="01"><tr data-hour-meta="01"><td>01</td><td>2</td></tr></table></td></tr></table>`;
+    const exact = taggedTable(nestedDoubleItem, "data-section", "hourly-exact");
+    const outerRow = requiredItem(directTableRows(exact), 0, "伪双列外层小时行");
+
+    expect(nestedDoubleItem.match(/data-hour-value=/g)).toHaveLength(2);
+    expect(directTableRows(exact)).toHaveLength(1);
+    expect(directRowCells(outerRow)).toHaveLength(2);
+  });
+});
 
 describe("PushPlus 仪表盘外壳", () => {
   it("渲染额度进度、未授权说明和安全页脚", () => {
@@ -131,6 +262,41 @@ describe("PushPlus 仪表盘外壳", () => {
     expect(content).not.toContain('data-section="models"');
   });
 
+  it("每项额度的进度条独占下一整行，不与文字和百分比争抢宽度", () => {
+    const content = renderUsageDashboardHtml(
+      availableInput(completeAggregate())
+    );
+    const quotas = [
+      { key: "rolling", label: "5 小时额度" },
+      { key: "weekly", label: "每周额度" },
+      { key: "monthly", label: "每月额度" }
+    ] as const;
+
+    for (const quota of quotas) {
+      const table = taggedTable(content, "data-quota", quota.key);
+      const rows = directTableRows(table);
+      expect(rows).toHaveLength(2);
+
+      const meta = requiredItem(rows, 0, `${quota.key} 额度元信息行`);
+      const bar = requiredItem(rows, 1, `${quota.key} 额度进度条行`);
+      expect(attributeValue(meta, "data-quota-meta")).toBe(quota.key);
+      expect(directRowCells(meta)).toHaveLength(2);
+      expect(meta.innerHtml).toContain(quota.label);
+      expect(meta.innerHtml).toContain(`data-quota-reset="${quota.key}"`);
+      expect(meta.innerHtml).toContain(`data-quota-percent="${quota.key}"`);
+      expect(meta.innerHtml).not.toContain(`data-quota-track="${quota.key}"`);
+
+      expect(attributeValue(bar, "data-quota-bar-row")).toBe(quota.key);
+      const barCells = directRowCells(bar);
+      expect(barCells).toHaveLength(1);
+      const barCell = requiredItem(barCells, 0, `${quota.key} 额度进度条单元格`);
+      expect(attributeValue(barCell, "colspan")).toBe("2");
+      expect(attributeValue(barCell, "data-quota-track")).toBe(quota.key);
+      expect(bar.innerHtml).not.toContain(`data-quota-percent="${quota.key}"`);
+      expect(bar.innerHtml).not.toContain(`data-quota-reset="${quota.key}"`);
+    }
+  });
+
   it("为轨道和填充单元格同时提供兼容背景色", () => {
     const content = renderUsageDashboardHtml({
       testData: false,
@@ -163,8 +329,14 @@ describe("最终审查回归", () => {
     const axisHours = [...content.matchAll(
       /data-hour-axis="(?:0|6|12|18)"[^>]*>(\d{2})<\/td>/g
     )].map((match) => match[1]);
+    const exactHours = [...content.matchAll(/data-hour-row="(\d{2})"/g)]
+      .map((match) => match[1]);
 
     expect(axisHours).toEqual(["20", "02", "08", "14"]);
+    expect(exactHours).toEqual([
+      "20", "21", "22", "23", "00", "01", "02", "03", "04", "05", "06", "07",
+      "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"
+    ]);
   });
 
   it("精确值迷你条使用固定轨道和互补的填充与剩余单元格", () => {
@@ -173,12 +345,26 @@ describe("最终审查回归", () => {
     const small = miniBarItem(content, "01");
     const zero = miniBarItem(content, "02");
 
-    expect(full).toMatch(/^<table data-mini-bar="00" width="100%" height="6"/);
+    expect(full).toMatch(
+      /^<table data-mini-bar="00" width=(?:"100%"|100%) height=(?:"6"|6)/
+    );
     expect(full).toMatch(/<tr><td width="100%"[^>]*bgcolor="#2563eb"[^>]*><\/td><td width="0%"[^>]*><\/td><\/tr>/);
     expect(small).toMatch(/<tr><td width="1%"[^>]*bgcolor="#2563eb"[^>]*><\/td><td width="99%"[^>]*><\/td><\/tr>/);
     expect(zero).toMatch(/<tr><td width="0%"[^>]*><\/td><td width="100%"[^>]*><\/td><\/tr>/);
     expect(zero).not.toContain("#2563eb");
     expect(full + small + zero).not.toContain("&nbsp;");
+  });
+
+  it("每小时表和迷你条以全宽与归零间距渲染", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const full = miniBarItem(content, "00");
+
+    expect(content).toMatch(
+      /<table data-hour-value="00" width=(?:"100%"|100%) role=(?:"presentation"|presentation) cellspacing=(?:"0"|0) cellpadding=(?:"0"|0)>/
+    );
+    expect(full).toMatch(
+      /^<table data-mini-bar="00" width=(?:"100%"|100%) height=(?:"6"|6) cellspacing=(?:"0"|0) cellpadding=(?:"0"|0)/
+    );
   });
 
   it("顶部额度条在零和满格边界不渲染空段并兼容显示百分比", () => {
@@ -219,13 +405,60 @@ describe("最终审查回归", () => {
     expect(chart).not.toContain("&nbsp;");
   });
 
-  it("精确值区显示标题并为小时、条和右对齐数值设置兼容列", () => {
+  it("普通长度的 24 小时精确值也逐小时独占单列", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const exact = taggedTable(content, "data-section", "hourly-exact");
+    const rows = directTableRows(exact);
+    const hourRows = rows.filter((row) => attributeValue(row, "data-hour-row") !== undefined);
+    const hours = hourRows.map((row) => attributeValue(row, "data-hour-row"));
+
+    expect(content).toContain("24 小时精确值（Token）");
+    expect(content).toContain('data-hour-layout="single"');
+    expect(rows).toHaveLength(25);
+    expect(attributeValue(requiredItem(rows, 0, "精确值标题行"), "data-hour-row"))
+      .toBeUndefined();
+    expect(hours).toEqual(HOUR_ORDER);
+    expect(hourRows).toHaveLength(24);
+    expect(content).not.toContain('data-hour-layout="double"');
+
+    for (const [index, hour] of HOUR_ORDER.entries()) {
+      const hourRow = requiredItem(hourRows, index, `${hour} 小时外层行`);
+      const outerCells = directRowCells(hourRow);
+      expect(outerCells).toHaveLength(1);
+      const outerCell = requiredItem(outerCells, 0, `${hour} 小时外层单元格`);
+      const hourTables = directChildren(outerCell, "table");
+      expect(hourTables).toHaveLength(1);
+      const hourTable = requiredItem(hourTables, 0, `${hour} 小时数值表`);
+      expect(attributeValue(hourTable, "data-hour-value")).toBe(hour);
+
+      const valueRows = directTableRows(hourTable);
+      expect(valueRows).toHaveLength(2);
+      const metaRow = requiredItem(valueRows, 0, `${hour} 小时元信息行`);
+      const miniRow = requiredItem(valueRows, 1, `${hour} 小时迷你条行`);
+      expect(attributeValue(metaRow, "data-hour-meta")).toBe(hour);
+      expect(attributeValue(miniRow, "data-mini-bar-row")).toBe(hour);
+      const miniCells = directRowCells(miniRow);
+      expect(miniCells).toHaveLength(1);
+      const miniCell = requiredItem(miniCells, 0, `${hour} 小时迷你条单元格`);
+      expect(attributeValue(miniCell, "colspan")).toBe("2");
+      const miniTables = directChildren(miniCell, "table");
+      expect(miniTables).toHaveLength(1);
+      const miniTable = requiredItem(miniTables, 0, `${hour} 小时迷你条表`);
+      expect(attributeValue(miniTable, "data-mini-bar")).toBe(hour);
+    }
+  });
+
+  it("精确数值允许只在自身单元格内换行", () => {
     const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
     const firstHour = hourItem(content, "00");
 
-    expect(content).toContain("24 小时精确值（Token）");
-    expect(firstHour).toMatch(/<tr><td width="15%" nowrap>00<\/td><td width="45%">/);
-    expect(firstHour).toMatch(/<td width="40%" align="right" nowrap>100<\/td>/);
+    expect(content).toMatch(
+      /<table data-section="hourly-exact"[^>]*style="[^"]*white-space:normal[^"]*word-break:break-all[^"]*"/
+    );
+    expect(firstHour).toMatch(
+      /<tr data-hour-meta="00"><td nowrap>00<\/td><td width="70%" align="right">100<\/td>/
+    );
+    expect(firstHour).not.toMatch(/<td width="70%" align="right"[^>]*nowrap/);
   });
 
   it("截断数据同时保留部分小时口径和截断提示", () => {
@@ -261,12 +494,12 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(content).toContain("输出");
     expect(content).toContain("推理");
     expect(content).toContain("缓存");
-    expect(content).toContain('data-hour-layout="double"');
+    expect(content).toContain('data-hour-layout="single"');
     expect(content.match(/data-hour-value=/g)).toHaveLength(24);
 
     const hourValues = [...content.matchAll(/data-hour-value="(\d{2})"/g)]
       .map((match) => match[1]);
-    expect(hourValues).toEqual(DOUBLE_HOUR_ORDER);
+    expect(hourValues).toEqual(HOUR_ORDER);
     expect(hourItem(content, "00")).toContain(">100</td>");
     expect(hourItem(content, "01")).toContain(">1</td>");
     expect(hourItem(content, "02")).toContain(">0</td>");
@@ -318,8 +551,8 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(content).toContain("$0.0000");
     expect(content.match(/data-hour-bar="\d{2}"[^>]*height:0/g)).toHaveLength(24);
     expect([...content.matchAll(/data-hour-value="(\d{2})"/g)].map((match) => match[1]))
-      .toEqual(DOUBLE_HOUR_ORDER);
-    const zeroHourItems = DOUBLE_HOUR_ORDER.map((hour) => hourItem(content, hour));
+      .toEqual(HOUR_ORDER);
+    const zeroHourItems = HOUR_ORDER.map((hour) => hourItem(content, hour));
     expect(zeroHourItems).toHaveLength(24);
     expect(zeroHourItems.every((item) => item.includes(">0</td>"))).toBe(true);
     const zeroBars = content.match(/<td data-hour-bar="\d{2}"[^>]*>.*?<\/td>/g) ?? [];
@@ -335,6 +568,54 @@ describe("PushPlus 完整用量仪表盘", () => {
       expect(zeroMiniBar).not.toContain("&nbsp;");
     }
     expect(content).toContain("暂无模型记录");
+  });
+
+  it("兼容版逐桶保留 24 个不同的完整精确值且不生成迷你条", () => {
+    const aggregate = completeAggregate();
+    aggregate.buckets = DISTINCT_HOUR_VALUES.map((value, index) => ({
+      startAt: Date.UTC(2026, 7, 7, 16) + index * 60 * 60 * 1000,
+      inputTokens: value,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cacheTokens: 0
+    }));
+    const input = availableInput(aggregate);
+    const rich = renderUsageDashboardHtml(input, {
+      contentBudget: Number.MAX_SAFE_INTEGER
+    });
+    const compatible = renderUsageDashboardHtml(input, {
+      contentBudget: rich.length - 1
+    });
+    const exact = taggedTable(compatible, "data-section", "hourly-exact");
+    const rows = directTableRows(exact);
+    const hourRows = rows.filter((row) => attributeValue(row, "data-hour-row") !== undefined);
+
+    expect(compatible).toContain('data-dashboard-variant="compatibility"');
+    expect(rows).toHaveLength(25);
+    expect(hourRows.map((row) => attributeValue(row, "data-hour-row")))
+      .toEqual(HOUR_ORDER);
+
+    for (const [index, hour] of HOUR_ORDER.entries()) {
+      const hourRow = requiredItem(hourRows, index, `${hour} 小时兼容版外层行`);
+      const outerCells = directRowCells(hourRow);
+      expect(outerCells).toHaveLength(1);
+      const outerCell = requiredItem(outerCells, 0, `${hour} 小时兼容版外层单元格`);
+      const hourTables = directChildren(outerCell, "table");
+      expect(hourTables).toHaveLength(1);
+      const hourTable = requiredItem(hourTables, 0, `${hour} 小时兼容版数值表`);
+      expect(attributeValue(hourTable, "data-hour-value")).toBe(hour);
+
+      const valueRows = directTableRows(hourTable);
+      expect(valueRows).toHaveLength(1);
+      const metaRow = requiredItem(valueRows, 0, `${hour} 小时兼容版元信息行`);
+      expect(attributeValue(metaRow, "data-hour-meta")).toBe(hour);
+      expect(attributeValue(metaRow, "data-mini-bar-row")).toBeUndefined();
+      const metaCells = directRowCells(metaRow);
+      expect(metaCells).toHaveLength(2);
+      const valueCell = requiredItem(metaCells, 1, `${hour} 小时兼容版数值单元格`);
+      const expectedText = requiredItem(DISTINCT_HOUR_TEXT, index, `${hour} 小时期望值`);
+      expect(valueCell.innerHtml).toBe(expectedText);
+    }
   });
 
   it("为长数值、模型名、截断和预算降级保留确定性信息", () => {
@@ -374,7 +655,7 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(rich).toContain("9,007,199,254,740,991");
     expect(rich).toContain('data-hour-layout="single"');
     expect([...rich.matchAll(/data-hour-value="(\d{2})"/g)].map((match) => match[1]))
-      .toEqual(SINGLE_HOUR_ORDER);
+      .toEqual(HOUR_ORDER);
     expect(rich).toContain("甲".repeat(64));
     expect(rich).toContain("乙".repeat(63) + "…");
     expect(rich).toContain("&lt;img src=x&gt;");
@@ -393,6 +674,8 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(compatible).not.toContain('data-section="hourly-chart"');
     expect(compatible).not.toContain("data-mini-bar=");
     expect(compatible.match(/data-hour-value=/g)).toHaveLength(24);
+    expect(compatible.match(/data-hour-row="\d{2}"/g)).toHaveLength(24);
+    expect(compatible).not.toContain("data-mini-bar-row=");
     expect(compatible).toContain("9,007,199,254,740,991");
     expect(compatible).toContain("&lt;img src=x&gt;");
     expect(compatible).not.toContain("<img src=x>");
