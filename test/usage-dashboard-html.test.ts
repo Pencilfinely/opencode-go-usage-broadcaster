@@ -203,12 +203,26 @@ describe("最终审查回归", () => {
     const small = miniBarItem(content, "01");
     const zero = miniBarItem(content, "02");
 
-    expect(full).toMatch(/^<table data-mini-bar="00" width="100%" height="6"/);
+    expect(full).toMatch(
+      /^<table data-mini-bar="00" width=(?:"100%"|100%) height=(?:"6"|6)/
+    );
     expect(full).toMatch(/<tr><td width="100%"[^>]*bgcolor="#2563eb"[^>]*><\/td><td width="0%"[^>]*><\/td><\/tr>/);
     expect(small).toMatch(/<tr><td width="1%"[^>]*bgcolor="#2563eb"[^>]*><\/td><td width="99%"[^>]*><\/td><\/tr>/);
     expect(zero).toMatch(/<tr><td width="0%"[^>]*><\/td><td width="100%"[^>]*><\/td><\/tr>/);
     expect(zero).not.toContain("#2563eb");
     expect(full + small + zero).not.toContain("&nbsp;");
+  });
+
+  it("每小时表和迷你条以全宽与归零间距渲染", () => {
+    const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
+    const full = miniBarItem(content, "00");
+
+    expect(content).toMatch(
+      /<table data-hour-value="00" width=(?:"100%"|100%) role=(?:"presentation"|presentation) cellspacing=(?:"0"|0) cellpadding=(?:"0"|0)>/
+    );
+    expect(full).toMatch(
+      /^<table data-mini-bar="00" width=(?:"100%"|100%) height=(?:"6"|6) cellspacing=(?:"0"|0) cellpadding=(?:"0"|0)/
+    );
   });
 
   it("顶部额度条在零和满格边界不渲染空段并兼容显示百分比", () => {
@@ -271,10 +285,13 @@ describe("最终审查回归", () => {
     const content = renderUsageDashboardHtml(availableInput(completeAggregate()));
     const firstHour = hourItem(content, "00");
 
-    expect(firstHour).toMatch(
-      /<td[^>]*align="right"[^>]*style="[^"]*white-space:normal[^"]*"[^>]*>100<\/td>/
+    expect(content).toMatch(
+      /<table data-section="hourly-exact"[^>]*style="[^"]*white-space:normal[^"]*word-break:break-all[^"]*"/
     );
-    expect(firstHour).not.toMatch(/align="right"[^>]*nowrap/);
+    expect(firstHour).toMatch(
+      /<tr data-hour-meta="00"><td nowrap>00<\/td><td width="70%" align="right">100<\/td>/
+    );
+    expect(firstHour).not.toMatch(/<td width="70%" align="right"[^>]*nowrap/);
   });
 
   it("截断数据同时保留部分小时口径和截断提示", () => {

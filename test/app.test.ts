@@ -387,9 +387,12 @@ describe("定时广播编排", () => {
       .toHaveLength(24);
     expect(event?.content).toContain('data-hour-layout="single"');
     expect(event?.content).toMatch(
-      /data-hour-meta="\d{2}"[\s\S]*?<td width="70%" align="right"[^>]*white-space:normal[^>]*>0<\/td>/
+      /<table data-section="hourly-exact"[^>]*style="[^"]*white-space:normal[^"]*word-break:break-all[^"]*"/
     );
-    expect(event?.content).not.toMatch(/align="right"[^>]*nowrap>0<\/td>/);
+    expect(event?.content).toMatch(
+      /data-hour-meta="\d{2}"[\s\S]*?<td width="70%" align="right">0<\/td>/
+    );
+    expect(event?.content).not.toMatch(/<td width="70%" align="right"[^>]*nowrap>0<\/td>/);
     expect(event?.content).not.toContain("<img");
     expect(event?.content).not.toMatch(/[█░]/);
     expect(await env.DB.prepare(

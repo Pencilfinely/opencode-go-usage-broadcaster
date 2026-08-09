@@ -130,16 +130,16 @@ function renderHourlyChart(aggregate: UsageAggregate): string {
     const hour = hourFormat.format(new Date(bucket.startAt));
     const height = barHeight(totals[index] ?? 0, maximum);
     const bar = height === 0
-      ? `<td data-hour-bar="${hour}" height="0" style="height:0px"></td>`
+      ? `<td data-hour-bar="${hour}" height="0" style="height:0"></td>`
       : `<td data-hour-bar="${hour}" height="${height}" bgcolor="#2563eb" style="height:${height}px;background-color:#2563eb"></td>`;
-    return `<td height="88" valign="bottom"><table width="100%" cellspacing="0" cellpadding="0"><tr>${bar}</tr></table></td>`;
+    return `<td><table width="100%" cellspacing="0" cellpadding="0"><tr>${bar}</tr></table></td>`;
   }).join("");
   const axis = [0, 6, 12, 18].map((index) => {
     const bucket = aggregate.buckets[index];
     const hour = bucket ? hourFormat.format(new Date(bucket.startAt)) : "";
     return `<td data-hour-axis="${index}" colspan="6">${hour}</td>`;
   }).join("");
-  return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr>${bars}</tr><tr>${axis}</tr></table>`;
+  return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr height="88" valign="bottom">${bars}</tr><tr>${axis}</tr></table>`;
 }
 
 function renderTokenBreakdown(aggregate: UsageAggregate): string {
@@ -152,11 +152,11 @@ function renderHourValue(value: HourValue, includeMiniBar: boolean): string {
     ? ""
     : ' bgcolor="#2563eb" style="background-color:#2563eb"';
   const remainingPercent = 100 - value.miniPercent;
-  const miniBar = `<table data-mini-bar="${value.hour}" width="100%" height="6" bgcolor="#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
+  const miniBar = `<table data-mini-bar="${value.hour}" width=100% height=6 cellspacing=0 cellpadding=0 bgcolor="#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
   const miniBarRow = includeMiniBar
     ? `<tr data-mini-bar-row="${value.hour}"><td colspan="2">${miniBar}</td></tr>`
     : "";
-  return `<table data-hour-value="${value.hour}"><tr data-hour-meta="${value.hour}"><td>${value.hour}</td><td width="70%" align="right" style="white-space:normal;word-break:break-all">${value.displayValue}</td></tr>${miniBarRow}</table>`;
+  return `<table data-hour-value="${value.hour}" width=100% role=presentation cellspacing=0 cellpadding=0><tr data-hour-meta="${value.hour}"><td nowrap>${value.hour}</td><td width="70%" align="right">${value.displayValue}</td></tr>${miniBarRow}</table>`;
 }
 
 function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant): string {
@@ -165,7 +165,7 @@ function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant)
   const rows = values.map((value) =>
     `<tr data-hour-row="${value.hour}"><td>${renderHourValue(value, includeMiniBar)}</td></tr>`
   ).join("");
-  return `<table data-section="hourly-exact" data-hour-layout="single" width="100%" role="presentation" cellspacing="0" cellpadding="2"><tr><td><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
+  return `<table data-section="hourly-exact" data-hour-layout="single" width="100%" role="presentation" cellspacing="0" cellpadding="2" style="white-space:normal;word-break:break-all"><tr><td><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
 }
 
 function renderModels(aggregate: UsageAggregate): string {
@@ -211,9 +211,7 @@ function renderDashboardVariant(
   const title = (input.testData ? "【测试数据】" : "") +
     "OpenCode Go " + escapeHtmlText(input.statusLabel);
   const quotaRows = input.quotaRows.map(renderQuotaRow).join("");
-  const tableStyle = variant === "rich"
-    ? ' style="border-collapse:collapse"'
-    : "";
+  const tableStyle = "";
   const availableDetails = input.usageDetails.status === "available"
     ? renderAvailableDetails(input.usageDetails.aggregate, variant)
     : `<tr><td>${renderUsageDetails(input.usageDetails)}</td></tr>`;
