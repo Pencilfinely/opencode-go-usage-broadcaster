@@ -37,15 +37,27 @@ type PendingTableElement = ScannedTableElement & {
   start: number;
 };
 
+function requiredItem<T>(items: readonly T[], index: number, description: string): T {
+  const item = items[index];
+  if (item === undefined) {
+    throw new Error(`缺少${description}：索引 ${index}`);
+  }
+  return item;
+}
+
 function scanTableElements(content: string): ScannedTableElement[] {
   const roots: ScannedTableElement[] = [];
   const stack: PendingTableElement[] = [];
   const tags = content.matchAll(/<\/?(table|tbody|tr|td)\b[^>]*>/gi);
 
   for (const match of tags) {
-    const tag = match[1].toLowerCase() as ScannedTableElement["tag"];
-    const token = match[0];
+    const capturedTag = match[1];
     const position = match.index;
+    if (capturedTag === undefined || position === undefined) {
+      throw new Error("表格标签扫描结果缺少标签名或位置");
+    }
+    const tag = capturedTag.toLowerCase() as ScannedTableElement["tag"];
+    const token = match[0];
     if (!token.startsWith("</")) {
       const element: PendingTableElement = {
         tag,
@@ -209,10 +221,11 @@ describe("表格直接层级扫描器", () => {
   it("不会把嵌套双项同排误判为两个直接小时行", () => {
     const nestedDoubleItem = `<table data-section="hourly-exact"><tr data-hour-row="00"><td><table data-hour-value="00"><tr data-hour-meta="00"><td>00</td><td>1</td></tr></table></td><td><table data-hour-value="01"><tr data-hour-meta="01"><td>01</td><td>2</td></tr></table></td></tr></table>`;
     const exact = taggedTable(nestedDoubleItem, "data-section", "hourly-exact");
+    const outerRow = requiredItem(directTableRows(exact), 0, "伪双列外层小时行");
 
     expect(nestedDoubleItem.match(/data-hour-value=/g)).toHaveLength(2);
     expect(directTableRows(exact)).toHaveLength(1);
-    expect(directRowCells(directTableRows(exact)[0])).toHaveLength(2);
+    expect(directRowCells(outerRow)).toHaveLength(2);
   });
 });
 
@@ -264,7 +277,8 @@ describe("PushPlus 仪表盘外壳", () => {
       const rows = directTableRows(table);
       expect(rows).toHaveLength(2);
 
-      const [meta, bar] = rows;
+      const meta = requiredItem(rows, 0, `${quota.key} 额度元信息行`);
+      const bar = requiredItem(rows, 1, `${quota.key} 额度进度条行`);
       expect(attributeValue(meta, "data-quota-meta")).toBe(quota.key);
       expect(directRowCells(meta)).toHaveLength(2);
       expect(meta.innerHtml).toContain(quota.label);
@@ -275,8 +289,9 @@ describe("PushPlus 仪表盘外壳", () => {
       expect(attributeValue(bar, "data-quota-bar-row")).toBe(quota.key);
       const barCells = directRowCells(bar);
       expect(barCells).toHaveLength(1);
-      expect(attributeValue(barCells[0], "colspan")).toBe("2");
-      expect(attributeValue(barCells[0], "data-quota-track")).toBe(quota.key);
+      const barCell = requiredItem(barCells, 0, `${quota.key} 额度进度条单元格`);
+      expect(attributeValue(barCell, "colspan")).toBe("2");
+      expect(attributeValue(barCell, "data-quota-track")).toBe(quota.key);
       expect(bar.innerHtml).not.toContain(`data-quota-percent="${quota.key}"`);
       expect(bar.innerHtml).not.toContain(`data-quota-reset="${quota.key}"`);
     }
@@ -400,28 +415,36 @@ describe("最终审查回归", () => {
     expect(content).toContain("24 小时精确值（Token）");
     expect(content).toContain('data-hour-layout="single"');
     expect(rows).toHaveLength(25);
-    expect(attributeValue(rows[0], "data-hour-row")).toBeUndefined();
+    expect(attributeValue(requiredItem(rows, 0, "精确值标题行"), "data-hour-row"))
+      .toBeUndefined();
     expect(hours).toEqual(HOUR_ORDER);
     expect(hourRows).toHaveLength(24);
     expect(content).not.toContain('data-hour-layout="double"');
 
     for (const [index, hour] of HOUR_ORDER.entries()) {
-      const outerCells = directRowCells(hourRows[index]);
+      const hourRow = requiredItem(hourRows, index, `${hour} 小时外层行`);
+      const outerCells = directRowCells(hourRow);
       expect(outerCells).toHaveLength(1);
-      const hourTables = directChildren(outerCells[0], "table");
+      const outerCell = requiredItem(outerCells, 0, `${hour} 小时外层单元格`);
+      const hourTables = directChildren(outerCell, "table");
       expect(hourTables).toHaveLength(1);
-      expect(attributeValue(hourTables[0], "data-hour-value")).toBe(hour);
+      const hourTable = requiredItem(hourTables, 0, `${hour} 小时数值表`);
+      expect(attributeValue(hourTable, "data-hour-value")).toBe(hour);
 
-      const valueRows = directTableRows(hourTables[0]);
+      const valueRows = directTableRows(hourTable);
       expect(valueRows).toHaveLength(2);
-      expect(attributeValue(valueRows[0], "data-hour-meta")).toBe(hour);
-      expect(attributeValue(valueRows[1], "data-mini-bar-row")).toBe(hour);
-      const miniCells = directRowCells(valueRows[1]);
+      const metaRow = requiredItem(valueRows, 0, `${hour} 小时元信息行`);
+      const miniRow = requiredItem(valueRows, 1, `${hour} 小时迷你条行`);
+      expect(attributeValue(metaRow, "data-hour-meta")).toBe(hour);
+      expect(attributeValue(miniRow, "data-mini-bar-row")).toBe(hour);
+      const miniCells = directRowCells(miniRow);
       expect(miniCells).toHaveLength(1);
-      expect(attributeValue(miniCells[0], "colspan")).toBe("2");
-      const miniTables = directChildren(miniCells[0], "table");
+      const miniCell = requiredItem(miniCells, 0, `${hour} 小时迷你条单元格`);
+      expect(attributeValue(miniCell, "colspan")).toBe("2");
+      const miniTables = directChildren(miniCell, "table");
       expect(miniTables).toHaveLength(1);
-      expect(attributeValue(miniTables[0], "data-mini-bar")).toBe(hour);
+      const miniTable = requiredItem(miniTables, 0, `${hour} 小时迷你条表`);
+      expect(attributeValue(miniTable, "data-mini-bar")).toBe(hour);
     }
   });
 
@@ -573,19 +596,25 @@ describe("PushPlus 完整用量仪表盘", () => {
       .toEqual(HOUR_ORDER);
 
     for (const [index, hour] of HOUR_ORDER.entries()) {
-      const outerCells = directRowCells(hourRows[index]);
+      const hourRow = requiredItem(hourRows, index, `${hour} 小时兼容版外层行`);
+      const outerCells = directRowCells(hourRow);
       expect(outerCells).toHaveLength(1);
-      const hourTables = directChildren(outerCells[0], "table");
+      const outerCell = requiredItem(outerCells, 0, `${hour} 小时兼容版外层单元格`);
+      const hourTables = directChildren(outerCell, "table");
       expect(hourTables).toHaveLength(1);
-      expect(attributeValue(hourTables[0], "data-hour-value")).toBe(hour);
+      const hourTable = requiredItem(hourTables, 0, `${hour} 小时兼容版数值表`);
+      expect(attributeValue(hourTable, "data-hour-value")).toBe(hour);
 
-      const valueRows = directTableRows(hourTables[0]);
+      const valueRows = directTableRows(hourTable);
       expect(valueRows).toHaveLength(1);
-      expect(attributeValue(valueRows[0], "data-hour-meta")).toBe(hour);
-      expect(attributeValue(valueRows[0], "data-mini-bar-row")).toBeUndefined();
-      const metaCells = directRowCells(valueRows[0]);
+      const metaRow = requiredItem(valueRows, 0, `${hour} 小时兼容版元信息行`);
+      expect(attributeValue(metaRow, "data-hour-meta")).toBe(hour);
+      expect(attributeValue(metaRow, "data-mini-bar-row")).toBeUndefined();
+      const metaCells = directRowCells(metaRow);
       expect(metaCells).toHaveLength(2);
-      expect(metaCells[1].innerHtml).toBe(DISTINCT_HOUR_TEXT[index]);
+      const valueCell = requiredItem(metaCells, 1, `${hour} 小时兼容版数值单元格`);
+      const expectedText = requiredItem(DISTINCT_HOUR_TEXT, index, `${hour} 小时期望值`);
+      expect(valueCell.innerHtml).toBe(expectedText);
     }
   });
 
