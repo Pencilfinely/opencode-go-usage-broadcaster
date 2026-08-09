@@ -131,7 +131,10 @@ function renderHourlyChart(aggregate: UsageAggregate): string {
   const bars = aggregate.buckets.map((bucket, index) => {
     const hour = hourFormat.format(new Date(bucket.startAt));
     const height = barHeight(totals[index] ?? 0, maximum);
-    return `<td height="88" valign="bottom"><table><tr><td data-hour-bar="${hour}" height="${height}" bgcolor="#2563eb" style="height:${height}px;background-color:#2563eb">&nbsp;</td></tr></table></td>`;
+    const bar = height === 0
+      ? `<td data-hour-bar="${hour}" height="0" style="height:0px"></td>`
+      : `<td data-hour-bar="${hour}" height="${height}" bgcolor="#2563eb" style="height:${height}px;background-color:#2563eb">&nbsp;</td>`;
+    return `<td height="88" valign="bottom"><table><tr>${bar}</tr></table></td>`;
   }).join("");
   return `<table data-section="hourly-chart" width="100%" role="presentation" cellspacing="1" cellpadding="0"><tr>${bars}</tr><tr><td colspan="6">00</td><td colspan="6">06</td><td colspan="6">12</td><td colspan="6">18</td></tr></table>`;
 }
@@ -142,9 +145,9 @@ function renderTokenBreakdown(aggregate: UsageAggregate): string {
 }
 
 function renderHourValue(value: HourValue, includeMiniBar: boolean): string {
-  const miniBar = includeMiniBar
-    ? `<table data-mini-bar="${value.hour}"><tr><td width="${value.miniPercent}%" bgcolor="#2563eb" style="background-color:#2563eb">&nbsp;</td></tr></table>`
-    : "";
+  const miniBar = !includeMiniBar ? "" : value.miniPercent === 0
+    ? `<table data-mini-bar="${value.hour}"><tr><td width="0%"></td></tr></table>`
+    : `<table data-mini-bar="${value.hour}"><tr><td width="${value.miniPercent}%" bgcolor="#2563eb" style="background-color:#2563eb">&nbsp;</td></tr></table>`;
   return `<table data-hour-value="${value.hour}"><tr><td>${value.hour}</td><td>${miniBar}</td><td>${value.displayValue}</td></tr></table>`;
 }
 

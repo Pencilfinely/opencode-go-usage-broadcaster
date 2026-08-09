@@ -6,6 +6,16 @@ import {
 } from "../src/usage-dashboard-html";
 import type { UsageAggregate, UsageHourBucket } from "../src/usage-domain";
 
+const DOUBLE_HOUR_ORDER = [
+  "00", "12", "01", "13", "02", "14", "03", "15", "04", "16", "05", "17",
+  "06", "18", "07", "19", "08", "20", "09", "21", "10", "22", "11", "23"
+];
+
+const SINGLE_HOUR_ORDER = [
+  "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11",
+  "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23"
+];
+
 function hourlyBuckets(values: readonly number[]): UsageHourBucket[] {
   return values.map((value, index) => ({
     startAt: Date.UTC(2026, 7, 7, 16) + index * 60 * 60 * 1000,
@@ -57,6 +67,15 @@ function completeAggregate(): UsageAggregate {
       { model: "其他", tokenCount: 6, sharePercent: 5.9 }
     ]
   };
+}
+
+function hourItem(content: string, hour: string): string {
+  const marker = `data-hour-value="${hour}"`;
+  const start = content.indexOf(marker);
+  const nextHour = content.indexOf("data-hour-value=", start + marker.length);
+  const models = content.indexOf('data-section="models"', start + marker.length);
+  const end = nextHour === -1 ? models : nextHour;
+  return content.slice(start, end === -1 ? content.length : end);
 }
 
 describe("PushPlus 仪表盘外壳", () => {
@@ -133,18 +152,16 @@ describe("PushPlus 完整用量仪表盘", () => {
 
     const hourValues = [...content.matchAll(/data-hour-value="(\d{2})"/g)]
       .map((match) => match[1]);
-    for (let index = 0; index < 12; index += 1) {
-      expect(hourValues.slice(index * 2, index * 2 + 2)).toEqual([
-        String(index).padStart(2, "0"),
-        String(index + 12).padStart(2, "0")
-      ]);
-    }
-    expect(content).toMatch(/data-hour-value="00"[\s\S]*?>[\s\S]*?>100</);
-    expect(content).toMatch(/data-hour-value="01"[\s\S]*?>[\s\S]*?>1</);
-    expect(content).toMatch(/data-hour-value="02"[\s\S]*?>[\s\S]*?>0</);
-    expect(content).toMatch(/data-hour-value="00"[\s\S]*?data-mini-bar="00"[\s\S]*?width="100%"/);
-    expect(content).toMatch(/data-hour-value="01"[\s\S]*?data-mini-bar="01"[\s\S]*?width="1%"/);
-    expect(content).toMatch(/data-hour-value="02"[\s\S]*?data-mini-bar="02"[\s\S]*?width="0%"/);
+    expect(hourValues).toEqual(DOUBLE_HOUR_ORDER);
+    expect(hourItem(content, "00")).toContain("<td>100</td>");
+    expect(hourItem(content, "01")).toContain("<td>1</td>");
+    expect(hourItem(content, "02")).toContain("<td>0</td>");
+    expect(hourItem(content, "00")).toContain('data-mini-bar="00"');
+    expect(hourItem(content, "00")).toContain('width="100%"');
+    expect(hourItem(content, "01")).toContain('data-mini-bar="01"');
+    expect(hourItem(content, "01")).toContain('width="1%"');
+    expect(hourItem(content, "02")).toContain('data-mini-bar="02"');
+    expect(hourItem(content, "02")).toContain('width="0%"');
     expect(content).toContain(">7<");
     expect(content).toContain(">101<");
     expect(content).toContain("$1.2346");
@@ -186,7 +203,23 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(content).toContain(">0<");
     expect(content).toContain("$0.0000");
     expect(content.match(/data-hour-bar="\d{2}"[^>]*height:0/g)).toHaveLength(24);
-    expect(content.match(/data-hour-value="\d{2}"[\s\S]*?>0<\/td>/g)).toHaveLength(24);
+    expect([...content.matchAll(/data-hour-value="(\d{2})"/g)].map((match) => match[1]))
+      .toEqual(DOUBLE_HOUR_ORDER);
+    const zeroHourItems = DOUBLE_HOUR_ORDER.map((hour) => hourItem(content, hour));
+    expect(zeroHourItems).toHaveLength(24);
+    expect(zeroHourItems.every((item) => item.includes("<td>0</td>"))).toBe(true);
+    const zeroBars = content.match(/<td data-hour-bar="\d{2}"[^>]*>.*?<\/td>/g) ?? [];
+    expect(zeroBars).toHaveLength(24);
+    for (const zeroBar of zeroBars) {
+      expect(zeroBar).not.toMatch(/(?:bgcolor|background-color)=/);
+      expect(zeroBar).not.toContain("&nbsp;");
+    }
+    const zeroMiniBars = content.match(/<table data-mini-bar="\d{2}">[\s\S]*?<\/table>/g) ?? [];
+    expect(zeroMiniBars).toHaveLength(24);
+    for (const zeroMiniBar of zeroMiniBars) {
+      expect(zeroMiniBar).not.toMatch(/(?:bgcolor|background-color)=/);
+      expect(zeroMiniBar).not.toContain("&nbsp;");
+    }
     expect(content).toContain("暂无模型记录");
   });
 
@@ -227,7 +260,7 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(rich).toContain("9,007,199,254,740,991");
     expect(rich).toContain('data-hour-layout="single"');
     expect([...rich.matchAll(/data-hour-value="(\d{2})"/g)].map((match) => match[1]))
-      .toEqual(Array.from({ length: 24 }, (_, index) => String(index).padStart(2, "0")));
+      .toEqual(SINGLE_HOUR_ORDER);
     expect(rich).toContain("甲".repeat(64));
     expect(rich).toContain("乙".repeat(63) + "…");
     expect(rich).toContain("&lt;img src=x&gt;");
