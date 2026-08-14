@@ -147,23 +147,22 @@ function renderTokenBreakdown(aggregate: UsageAggregate): string {
   return `<table data-section="token-breakdown" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>输入<br><strong>${usageValue(tokens.inputTokens, truncated)}</strong></td><td>输出<br><strong>${usageValue(tokens.outputTokens, truncated)}</strong></td></tr><tr><td>推理<br><strong>${usageValue(tokens.reasoningTokens, truncated)}</strong></td><td>缓存<br><strong>${usageValue(tokens.cacheTokens, truncated)}</strong></td></tr></table>`;
 }
 
-function renderHourValue(value: HourValue, includeMiniBar: boolean): string {
+function renderHourValue(value: HourValue, includeMiniBarMarker: boolean): string {
   const fillStyle = value.miniPercent === 0
     ? ""
     : ' bgcolor="#2563eb" style="background-color:#2563eb"';
   const remainingPercent = 100 - value.miniPercent;
   const miniBar = `<table data-mini-bar="${value.hour}" width=100% height=6 cellspacing=0 cellpadding=0 bgcolor="#e5e7eb"><tr><td width="${value.miniPercent}%"${fillStyle}></td><td width="${remainingPercent}%"></td></tr></table>`;
-  const miniBarRow = includeMiniBar
-    ? `<tr data-mini-bar-row="${value.hour}"><td colspan="2">${miniBar}</td></tr>`
-    : "";
+  const miniBarMarker = includeMiniBarMarker ? ` data-mini-bar-row="${value.hour}"` : "";
+  const miniBarRow = `<tr${miniBarMarker}><td colspan="2">${miniBar}</td></tr>`;
   return `<table data-hour-value="${value.hour}" width=100% role=presentation cellspacing=0 cellpadding=0><tr data-hour-meta="${value.hour}"><td nowrap>${value.hour}</td><td width="70%" align="right">${value.displayValue}</td></tr>${miniBarRow}</table>`;
 }
 
 function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant): string {
   const values = hourlyValues(aggregate);
-  const includeMiniBar = variant === "rich";
+  const includeMiniBarMarker = variant === "rich";
   const rows = values.map((value) =>
-    `<tr data-hour-row="${value.hour}"><td>${renderHourValue(value, includeMiniBar)}</td></tr>`
+    `<tr data-hour-row="${value.hour}"><td>${renderHourValue(value, includeMiniBarMarker)}</td></tr>`
   ).join("");
   return `<table data-section="hourly-exact" data-hour-layout="single" width="100%" role="presentation" cellspacing="0" cellpadding="2" style="white-space:normal;word-break:break-all"><tr><td><strong>24 小时精确值（Token）</strong></td></tr>${rows}</table>`;
 }
