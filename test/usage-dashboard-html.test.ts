@@ -570,7 +570,7 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(content).toContain("暂无模型记录");
   });
 
-  it("兼容版逐桶保留 24 个不同的完整精确值且不生成迷你条", () => {
+  it("兼容版逐桶保留 24 个不同的完整精确值和迷你条", () => {
     const aggregate = completeAggregate();
     aggregate.buckets = DISTINCT_HOUR_VALUES.map((value, index) => ({
       startAt: Date.UTC(2026, 7, 7, 16) + index * 60 * 60 * 1000,
@@ -606,15 +606,21 @@ describe("PushPlus 完整用量仪表盘", () => {
       expect(attributeValue(hourTable, "data-hour-value")).toBe(hour);
 
       const valueRows = directTableRows(hourTable);
-      expect(valueRows).toHaveLength(1);
+      expect(valueRows).toHaveLength(2);
       const metaRow = requiredItem(valueRows, 0, `${hour} 小时兼容版元信息行`);
       expect(attributeValue(metaRow, "data-hour-meta")).toBe(hour);
-      expect(attributeValue(metaRow, "data-mini-bar-row")).toBeUndefined();
       const metaCells = directRowCells(metaRow);
       expect(metaCells).toHaveLength(2);
       const valueCell = requiredItem(metaCells, 1, `${hour} 小时兼容版数值单元格`);
       const expectedText = requiredItem(DISTINCT_HOUR_TEXT, index, `${hour} 小时期望值`);
       expect(valueCell.innerHtml).toBe(expectedText);
+
+      const miniRow = requiredItem(valueRows, 1, `${hour} 小时兼容版迷你条行`);
+      const miniCells = directRowCells(miniRow);
+      expect(miniCells).toHaveLength(1);
+      expect(attributeValue(requiredItem(miniCells, 0, `${hour} 小时兼容版迷你条单元格`), "colspan"))
+        .toBe("2");
+      expect(miniBarItem(hourTable.outerHtml, hour)).not.toBe("");
     }
   });
 
@@ -672,10 +678,9 @@ describe("PushPlus 完整用量仪表盘", () => {
     });
     expect(compatible).toContain('data-dashboard-variant="compatibility"');
     expect(compatible).not.toContain('data-section="hourly-chart"');
-    expect(compatible).not.toContain("data-mini-bar=");
+    expect(compatible.match(/data-mini-bar="\d{2}"/g)).toHaveLength(24);
     expect(compatible.match(/data-hour-value=/g)).toHaveLength(24);
     expect(compatible.match(/data-hour-row="\d{2}"/g)).toHaveLength(24);
-    expect(compatible).not.toContain("data-mini-bar-row=");
     expect(compatible).toContain("9,007,199,254,740,991");
     expect(compatible).toContain("&lt;img src=x&gt;");
     expect(compatible).not.toContain("<img src=x>");
@@ -684,7 +689,39 @@ describe("PushPlus 完整用量仪表盘", () => {
 
     const production = renderUsageDashboardHtml(input);
     expect(production.length).toBeLessThanOrEqual(DASHBOARD_CONTENT_BUDGET);
+    expect(production.match(/data-mini-bar="\d{2}"/g)).toHaveLength(24);
     expect(() => renderUsageDashboardHtml(input, { contentBudget: 1 }))
       .toThrow(RangeError);
+  });
+
+  it("兼容版在最坏模型名转义下仍保留 24 条迷你条并满足正文预算", () => {
+    const maximum = Number.MAX_SAFE_INTEGER;
+    const aggregate = completeAggregate();
+    aggregate.tokens = {
+      inputTokens: maximum,
+      outputTokens: maximum,
+      reasoningTokens: maximum,
+      cacheTokens: maximum,
+      totalTokens: maximum
+    };
+    aggregate.buckets = hourlyBuckets(Array(24).fill(maximum)).map((bucket) => ({
+      ...bucket,
+      inputTokens: maximum,
+      outputTokens: maximum,
+      reasoningTokens: maximum,
+      cacheTokens: maximum
+    }));
+    aggregate.models = Array.from({ length: 6 }, () => ({
+      model: '"'.repeat(64),
+      tokenCount: maximum,
+      sharePercent: 100
+    }));
+
+    const production = renderUsageDashboardHtml(availableInput(aggregate));
+
+    expect(production).toContain('data-dashboard-variant="compatibility"');
+    expect(production.length).toBeLessThanOrEqual(DASHBOARD_CONTENT_BUDGET);
+    expect(production.match(/data-mini-bar="\d{2}"/g)).toHaveLength(24);
+    expect(production.match(/data-hour-value="\d{2}"/g)).toHaveLength(24);
   });
 });
