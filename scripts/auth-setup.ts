@@ -257,13 +257,18 @@ export function resolveProfileWorkspaceId(
     if (!WORKSPACE_ID.test(requested)) throw new Error("工作区 ID 无效");
     return requested;
   }
+  const workspaceIds = profileWorkspaceIds(context);
+  if (workspaceIds.size === 1) return [...workspaceIds][0] as string;
+  throw new Error("复用浏览器资料时无法唯一识别工作区，请通过 --workspace 指定");
+}
+
+function profileWorkspaceIds(context: PageUrlContext): Set<string> {
   const workspaceIds = new Set<string>();
   for (const page of context.pages()) {
     const workspaceId = workspaceIdFromPageUrl(page.url());
     if (workspaceId) workspaceIds.add(workspaceId);
   }
-  if (workspaceIds.size === 1) return [...workspaceIds][0] as string;
-  throw new Error("复用浏览器资料时无法唯一识别工作区，请通过 --workspace 指定");
+  return workspaceIds;
 }
 
 export async function requireOpenCodeAuthCookie(
@@ -318,9 +323,20 @@ export async function preparePersistentProfileAuthorization(
   signal.throwIfAborted();
   const existingAuthCookieValue = await readOpenCodeAuthCookie(context);
   if (existingAuthCookieValue !== undefined) {
+    let authCookieValue = existingAuthCookieValue;
+    if (
+      requestedWorkspaceId === undefined &&
+      profileWorkspaceIds(context).size === 0
+    ) {
+      await openAuthenticationPage(context, signal);
+      signal.throwIfAborted();
+      onLoginRequired();
+      await waitForWorkspaceId(context, signal);
+      authCookieValue = await requireOpenCodeAuthCookie(context);
+    }
     return {
       workspaceId: resolveProfileWorkspaceId(context, requestedWorkspaceId),
-      authCookieValue: existingAuthCookieValue,
+      authCookieValue,
       reusedExistingSession: true
     };
   }
@@ -416,7 +432,7 @@ async function collectSessionBundle(
         options.workspaceId,
         signal,
         () => console.log(
-          "请完成一次 GitHub 登录并进入任一工作区；登录状态会保留在指定的浏览器资料目录。"
+          "正在恢复 OpenCode 登录；若浏览器显示登录页，请完成 GitHub 登录并进入任一工作区。"
         )
       );
       workspaceId = persistentProfile.workspaceId;

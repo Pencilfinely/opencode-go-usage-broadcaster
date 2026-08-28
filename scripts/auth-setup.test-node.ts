@@ -688,6 +688,72 @@ test("复用浏览器资料时先校验登录 Cookie，再识别工作区", asyn
   });
 });
 
+test("复用登录资料但没有工作区标签页时自动恢复工作区", async () => {
+  const module = await import("./auth-setup");
+  const preparePersistentProfileAuthorization = (module as Record<string, unknown>)
+    .preparePersistentProfileAuthorization as ((
+      context: {
+        cookies(url: string): Promise<Array<{ name: string; value: string }>>;
+        pages(): Array<{ url(): string }>;
+        newPage(): Promise<unknown>;
+      },
+      requestedWorkspaceId: string | undefined,
+      signal: AbortSignal,
+      onLoginRequired: () => void
+    ) => Promise<{
+      workspaceId: string;
+      authCookieValue: string;
+      reusedExistingSession: boolean;
+    }>) | undefined;
+
+  assert.equal(typeof preparePersistentProfileAuthorization, "function");
+  if (!preparePersistentProfileAuthorization) return;
+  const urls = ["about:blank"];
+  const controller = new AbortController();
+  let loginPrompts = 0;
+  let openedPages = 0;
+  let cookieChecks = 0;
+
+  const prepared = await preparePersistentProfileAuthorization(
+    {
+      async cookies(url) {
+        assert.equal(url, "https://opencode.ai");
+        cookieChecks += 1;
+        return [{
+          name: "auth",
+          value: cookieChecks === 1 ? "saved-cookie" : "renewed-cookie"
+        }];
+      },
+      pages() {
+        return urls.map((url) => ({ url: () => url }));
+      },
+      async newPage() {
+        openedPages += 1;
+        return {
+          async goto(url: string, options: Record<string, unknown>) {
+            assert.equal(url, "https://opencode.ai/auth");
+            assert.equal(options.waitUntil, "commit");
+            assert.equal(options.signal, controller.signal);
+            urls.push("https://opencode.ai/workspace/wrk_Recovered/usage");
+          }
+        };
+      }
+    },
+    undefined,
+    controller.signal,
+    () => { loginPrompts += 1; }
+  );
+
+  assert.deepEqual(prepared, {
+    workspaceId: "wrk_Recovered",
+    authCookieValue: "renewed-cookie",
+    reusedExistingSession: true
+  });
+  assert.equal(openedPages, 1);
+  assert.equal(loginPrompts, 1);
+  assert.equal(cookieChecks, 2);
+});
+
 test("全新持久资料会完成首次登录并保留可复用状态", async () => {
   const module = await import("./auth-setup");
   const preparePersistentProfileAuthorization = (module as Record<string, unknown>)
