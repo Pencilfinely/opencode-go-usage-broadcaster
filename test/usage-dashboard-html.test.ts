@@ -666,11 +666,11 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(rich).toContain("乙".repeat(63) + "…");
     expect(rich).toContain("&lt;img src=x&gt;");
     expect(rich).not.toContain("<img src=x>");
-    expect(rich).toContain("至少24");
-    expect(rich).toContain("至少9,007,199,254,740,991");
-    expect(rich).toContain("至少0");
-    expect(rich).toContain("至少$1.2346");
-    expect(rich).toContain("至少100.0%");
+    expect(rich).not.toContain("至少");
+    expect(rich).toContain("<strong>24</strong>");
+    expect(rich).toContain("<strong>$1.2346</strong>");
+    expect(rich).toContain(">100.0%</td>");
+    expect(rich).toContain("数据已截断，仅展示已采集范围。");
     expect(rich).toContain("仅含已采集的最新记录");
 
     const compatible = renderUsageDashboardHtml(input, {
@@ -684,6 +684,8 @@ describe("PushPlus 完整用量仪表盘", () => {
     expect(compatible).toContain("9,007,199,254,740,991");
     expect(compatible).toContain("&lt;img src=x&gt;");
     expect(compatible).not.toContain("<img src=x>");
+    expect(compatible).not.toContain("至少");
+    expect(compatible).toContain("数据已截断，仅展示已采集范围。");
     expect(compatible).toContain("事件：event-budget");
     expect(compatible.length).toBeLessThanOrEqual(DASHBOARD_CONTENT_BUDGET);
 

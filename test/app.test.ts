@@ -188,6 +188,42 @@ describe("定时广播编排", () => {
     expect(usageSourceFetch).toHaveBeenCalledWith(scheduledAt);
   });
 
+  it("截断明细写入最终发送内容时不添加至少并保留提示", async () => {
+    const scheduledAt = Date.parse("2026-08-05T01:00:00Z");
+
+    await runScheduled(
+      createScheduledController({
+        scheduledTime: new Date(scheduledAt),
+        cron: "0 1-15 * * *"
+      }),
+      testEnv(),
+      createExecutionContext(),
+      {
+        source: { fetch: vi.fn().mockResolvedValue(snapshot(20, scheduledAt)) },
+        usageSource: {
+          fetch: vi.fn().mockResolvedValue({
+            status: "truncated",
+            records: [usageRecord("usage-truncated", scheduledAt - 60_000)],
+            pagesRead: 40,
+            reason: "page-limit"
+          })
+        },
+        fetchImpl: vi.fn().mockResolvedValue(
+          Response.json({ code: 200, data: "provider-id" })
+        ),
+        now: () => scheduledAt
+      }
+    );
+
+    const event = await env.DB.prepare(
+      "SELECT content FROM outbox_events WHERE kind = 'daily'"
+    ).first<{ content: string }>();
+    expect(event?.content).not.toContain("至少");
+    expect(event?.content).toContain("最近 24 小时请求数<br><strong>1</strong>");
+    expect(event?.content).toContain("数据已截断，仅展示已采集范围。");
+    expect(event?.content).toContain("仅含已采集的最新记录。");
+  });
+
   it("提交前续租失败时不提交或投递", async () => {
     const occurredAt = Date.parse("2026-08-05T02:30:00Z");
     const renew = vi.spyOn(Repository.prototype, "renewSnapshotLease")

@@ -91,13 +91,12 @@ function modelDisplayName(value: string): string {
   return escapeHtmlText(display);
 }
 
-function usageValue(value: number, truncated: boolean): string {
-  return (truncated ? "至少" : "") + integerFormat.format(value);
+function usageValue(value: number): string {
+  return integerFormat.format(value);
 }
 
-function costValue(costMicroCents: number, truncated: boolean): string {
-  return (truncated ? "至少" : "") +
-    "$" + (costMicroCents / 100000000).toFixed(4);
+function costValue(costMicroCents: number): string {
+  return "$" + (costMicroCents / 100000000).toFixed(4);
 }
 
 interface HourValue {
@@ -120,7 +119,7 @@ function hourlyValues(aggregate: UsageAggregate): HourValue[] {
 }
 
 function renderSummary(aggregate: UsageAggregate): string {
-  return `<table data-section="summary" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>最近 24 小时请求数<br><strong>${usageValue(aggregate.requestCount, aggregate.truncated)}</strong></td><td>总 Token<br><strong>${usageValue(aggregate.tokens.totalTokens, aggregate.truncated)}</strong></td><td>费用<br><strong>${costValue(aggregate.costMicroCents, aggregate.truncated)}</strong></td></tr></table>`;
+  return `<table data-section="summary" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>最近 24 小时请求数<br><strong>${usageValue(aggregate.requestCount)}</strong></td><td>总 Token<br><strong>${usageValue(aggregate.tokens.totalTokens)}</strong></td><td>费用<br><strong>${costValue(aggregate.costMicroCents)}</strong></td></tr></table>`;
 }
 
 function renderHourlyChart(aggregate: UsageAggregate): string {
@@ -143,8 +142,8 @@ function renderHourlyChart(aggregate: UsageAggregate): string {
 }
 
 function renderTokenBreakdown(aggregate: UsageAggregate): string {
-  const { tokens, truncated } = aggregate;
-  return `<table data-section="token-breakdown" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>输入<br><strong>${usageValue(tokens.inputTokens, truncated)}</strong></td><td>输出<br><strong>${usageValue(tokens.outputTokens, truncated)}</strong></td></tr><tr><td>推理<br><strong>${usageValue(tokens.reasoningTokens, truncated)}</strong></td><td>缓存<br><strong>${usageValue(tokens.cacheTokens, truncated)}</strong></td></tr></table>`;
+  const { tokens } = aggregate;
+  return `<table data-section="token-breakdown" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>输入<br><strong>${usageValue(tokens.inputTokens)}</strong></td><td>输出<br><strong>${usageValue(tokens.outputTokens)}</strong></td></tr><tr><td>推理<br><strong>${usageValue(tokens.reasoningTokens)}</strong></td><td>缓存<br><strong>${usageValue(tokens.cacheTokens)}</strong></td></tr></table>`;
 }
 
 function renderHourValue(value: HourValue, includeMiniBarMarker: boolean): string {
@@ -168,12 +167,12 @@ function renderHourlyExact(aggregate: UsageAggregate, variant: DashboardVariant)
 }
 
 function renderModels(aggregate: UsageAggregate): string {
-  const { models, truncated } = aggregate;
+  const { models } = aggregate;
   if (models.length === 0) {
     return `<table data-section="models" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>暂无模型记录</td></tr></table>`;
   }
   const rows = models.map((model) =>
-    `<tr><td>${modelDisplayName(model.model)}</td><td>${usageValue(model.tokenCount, truncated)}</td><td>${truncated ? "至少" : ""}${model.sharePercent.toFixed(1)}%</td></tr>`
+    `<tr><td>${modelDisplayName(model.model)}</td><td>${usageValue(model.tokenCount)}</td><td>${model.sharePercent.toFixed(1)}%</td></tr>`
   ).join("");
   return `<table data-section="models" width="100%" role="presentation" cellspacing="0" cellpadding="6"><tr><td>模型</td><td>Token</td><td>占比</td></tr>${rows}</table>`;
 }
@@ -184,7 +183,7 @@ function renderAvailableDetails(
 ): string {
   const chart = variant === "rich" ? renderHourlyChart(aggregate) : "";
   const truncatedCopy = aggregate.truncated
-    ? "<tr><td>数据已截断，汇总数值均为至少已采集范围。</td></tr>"
+    ? "<tr><td>数据已截断，仅展示已采集范围。</td></tr>"
     : "";
   return `<tr><td>${renderSummary(aggregate)}</td></tr>${chart === "" ? "" : `<tr><td>${chart}</td></tr>`}<tr><td>${renderTokenBreakdown(aggregate)}</td></tr><tr><td>${renderHourlyExact(aggregate, variant)}</td></tr><tr><td>${renderModels(aggregate)}</td></tr>${truncatedCopy}`;
 }
